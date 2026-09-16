@@ -18,10 +18,37 @@ Reconstruction of the CMB aberration dipole with a lensing quadratic estimator.
 
 Footprint
 ---------
-The default mask is now an ACT-like patch normalised to a target sky fraction
+--mask act is an ACT-like patch normalised to a target sky fraction
 (--fsky 0.2): a declination band (--act-dec, default -60 to +22 deg) whose RA
 half-width is solved for so that w1 comes out at exactly the requested f_sky,
-apodisation included.  The old --mask box / dec_band / none still work.
+apodisation included.  --mask box / dec_band / none also still work.
+
+--mask dr6 uses the real thing: the released ACT DR6 lensing analysis mask,
+the apodised mask that was applied to the CMB maps before the quadratic
+estimator, which is where reconstruct() applies it here too.  Get it with
+
+    wget https://phy-act1.princeton.edu/public/data/dr6_lensing_v1/maps/\
+baseline/mask_act_dr6_lensing_v1_healpix_nside_4096_baseline.fits
+
+(about 0.8 GB; other variants, e.g. galcut040, sit in the sibling
+directories, and the whole release is also on LAMBDA and on the NERSC
+portal).  Leave it in the working directory, or point --dr6-mask or
+$ACT_DR6_MASK at it.  Cite Madhavacheril et al 2304.05203 and Qu et al
+2304.05202.  It is healpix nside 4096, equatorial, 1 = keep, and already
+contains the galactic cut and the point-source and cluster holes, so
+--apod-deg does not apply to it.
+
+The mask is area-averaged down to --dr6-nside (default: whatever matches the
+map resolution) and then interpolated onto the CAR grid, and the projection is
+cached under <cache>/masks so the shards do not each repeat it.  The header
+compares the w factors of the projected mask against the exact healpix ones;
+if they disagree by more than a percent the pixels are too coarse for the
+source holes.  Two things the real footprint does that the smooth patch does
+not: w4/w2^2 is worse than the area alone suggests, and the holes couple much
+more power into high L, so the leakage numbers below want a finer --res than
+the L = 1 amplitude does.  Note also that the real analysis weights by the
+DR6 inverse-variance maps as well, which the white-noise model here does not,
+so this is the DR6 footprint and not a DR6 forecast.
 
 
 Higher L
@@ -65,6 +92,9 @@ Helped write some functions as well - further checking still needed to confirm e
 The f_sky solver, the packed low-L storage, the higher-L leakage estimator and
 the plotting module were also written with Claude; the leakage normalisation
 and the debiasing in particular still want an independent check.
+The DR6 mask loader (--mask dr6) was written with Claude as well: the
+healpix -> CAR projection settings and the w-factor resolution check are the
+parts to look at first, and it has not yet been run against the real file.
 """
 
 import argparse
@@ -77,12 +107,21 @@ import numpy as np
 import healpy as hp
 import camb
 
-from pixell import enmap, curvedsky, aberration, utils
+from pixell import enmap, curvedsky, aberration, reproject, utils
 from falafel import qe
 import pytempura
 
 
 # 1. Configuration
+
+# The released ACT DR6 lensing analysis mask: the apodised mask that was
+# applied to the CMB maps before the quadratic estimator, which is exactly
+# where reconstruct() applies it here.  Healpix nside 4096, equatorial, 1 =
+# keep, and the galactic cut and the point-source and cluster holes are
+# already in it.
+DR6_DEFAULT_NAME = "mask_act_dr6_lensing_v1_healpix_nside_4096_baseline.fits"
+DR6_URL_BASE = ("https://phy-act1.princeton.edu/public/data/dr6_lensing_v1/"
+                "maps/{variant}/")
 
 parser = argparse.ArgumentParser(
     description="CMB aberration reconstruction with a lensing quadratic estimator")
@@ -107,7 +146,29 @@ parser.add_argument("--lout", type=int, default=20,
                     help="highest multipole of the reconstruction that is "
                          "kept and analysed; L>=2 is the leakage")
 parser.add_argument("--mask", default="act",
-                    choices=["none", "box", "dec_band", "act"])
+                    choices=["none", "box", "dec_band", "act", "dr6"])
+parser.add_argument("--dr6-mask", default=None, metavar="PATH",
+                    help="for --mask dr6: the released ACT DR6 lensing "
+                         "analysis mask, healpix nside 4096, equatorial.  "
+                         "Defaults to $ACT_DR6_MASK, then to "
+                         "./" + DR6_DEFAULT_NAME)
+parser.add_argument("--dr6-variant", default="baseline",
+                    help="for --mask dr6: which released variant the file is "
+                         "(baseline, galcut040, tonly, ...).  Used for "
+                         "labelling and the cache key only; the file itself "
+                         "comes from --dr6-mask")
+parser.add_argument("--dr6-nside", type=int, default=None,
+                    help="for --mask dr6: area-average the healpix mask to "
+                         "this nside before projecting to CAR.  Default is "
+                         "the power of two closest to the map resolution, "
+                         "which keeps the w factors honest; 0 keeps the "
+                         "native nside and point-samples it")
+parser.add_argument("--dr6-smooth-arcmin", type=float, default=0.0,
+                    help="for --mask dr6: extra Gaussian smoothing FWHM "
+                         "applied to the released mask, in arcmin.  0 (the "
+                         "default) uses the released apodisation as it is; a "
+                         "nonzero value tapers the point-source holes and so "
+                         "changes the high-L leakage")
 parser.add_argument("--fsky", type=float, default=0.2,
                     help="for --mask act: target sky fraction w1; the RA "
                          "half-width of the patch is solved for to hit it")
@@ -143,10 +204,6 @@ parser.add_argument("--no-plots", dest="plots", action="store_false",
                     help="skip the figures (summary.npz is still written)")
 parser.add_argument("--plot-dir", default=None,
                     help="where the figures go; default <cache dir>/plots")
-parser.add_argument("--prepare", action="store_true",
-                    help="compute and cache the theory setup, then exit; run "
-                         "this once before launching shards so they all load "
-                         "it instead of each repeating CAMB and tempura")
 args = parser.parse_args()
 
 # multipoles
@@ -197,11 +254,64 @@ DEC_BAND_DEG = args.dec_band
 ACT_DEC = tuple(args.act_dec)
 APOD = args.apod_deg
 
+
+def _dr6_path():
+    """Where the released mask is, or a message saying how to get it."""
+    # An explicit --dr6-mask has to be the file that is used: falling back to
+    # a different one found in the working directory would mean analysing a
+    # mask nobody asked for.
+    if args.dr6_mask:
+        p = os.path.expanduser(args.dr6_mask)
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"--dr6-mask {args.dr6_mask} does not exist")
+        return p
+    env = os.environ.get("ACT_DR6_MASK")
+    if env:
+        p = os.path.expanduser(env)
+        if os.path.exists(p):
+            return p
+        print(f"WARNING: $ACT_DR6_MASK is set to {env}, which does not exist")
+    if os.path.exists(DR6_DEFAULT_NAME):
+        return DR6_DEFAULT_NAME
+    raise FileNotFoundError(
+        "--mask dr6 needs the released ACT DR6 lensing analysis mask.  "
+        f"Download it with\n\n    wget "
+        + DR6_URL_BASE.format(variant=args.dr6_variant)
+        + f"mask_act_dr6_lensing_v1_healpix_nside_4096_{args.dr6_variant}.fits"
+        + "\n\nthen point --dr6-mask or $ACT_DR6_MASK at it, or leave it in "
+          "the working directory.\n(Cite Madhavacheril et al 2304.05203 and "
+          "Qu et al 2304.05202 if you use it.)")
+
+
+def _match_nside(res_rad):
+    """Power-of-two nside whose pixels are closest to the map resolution.
+
+    A healpix pixel is sqrt(4 pi / 12) / nside radians across.  Averaging the
+    mask down to this nside before interpolating onto the CAR grid means the
+    CAR pixels see the mean weight over their own footprint rather than a
+    point sample of it, which is what keeps w2 and w4 from coming out high.
+    """
+    want = np.sqrt(4.0 * np.pi / 12.0) / res_rad
+    return int(np.clip(2 ** int(round(np.log2(max(want, 1.0)))), 32, 4096))
+
+
+if args.mask == "dr6":
+    DR6_PATH = _dr6_path()
+    DR6_NSIDE = (_match_nside(RES) if args.dr6_nside is None
+                 else int(args.dr6_nside))      # 0 means keep the native one
+else:
+    DR6_PATH, DR6_NSIDE = None, 0
+
 # A key naming every parameter the mask actually depends on, and only those:
 # putting the box ranges in the cache key unconditionally would invalidate a
 # dec_band cache whenever an unused box argument changed.
 if args.mask == "none":
     MASK_KEY = "none"
+elif args.mask == "dr6":
+    MASK_KEY = (f"dr6_{args.dr6_variant}_"
+                + (f"n{DR6_NSIDE}" if DR6_NSIDE else "native"))
+    if args.dr6_smooth_arcmin > 0:
+        MASK_KEY += f"_sm{args.dr6_smooth_arcmin:g}"
 elif args.mask == "act":
     MASK_KEY = ("act_dec{:g}to{:g}_rac{:g}_fsky{:g}"
                 .format(*ACT_DEC, args.ra_center, args.fsky))
@@ -212,7 +322,10 @@ elif args.mask == "dec_band":
     MASK_KEY = f"decband{DEC_BAND_DEG:g}"
 else:
     raise ValueError(args.mask)
-MASK_KEY += f"_apod{APOD:g}"
+# --apod-deg does not enter the dr6 mask: the released one is already
+# apodised, and --dr6-smooth-arcmin is the knob that changes it.
+if args.mask != "dr6":
+    MASK_KEY += f"_apod{APOD:g}"
 
 # boost info
 BETA = aberration.beta          # 0.001235 default
@@ -239,30 +352,11 @@ CASES = {
     "T+P": ["TT", "TE", "EE"],
 }
 
-CACHE_DIR = args.cache
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(args.cache, exist_ok=True)
 
-
-# The cache stores reconstructions, which depend on every setting above.  Keying
-# the directory on those settings means a run with a different mask, lmax or
-# noise level can never silently reload the wrong sims.  Change any of them and
-# you get a fresh directory; change nothing and the old results are reused.
-# "v2" marks the switch from a stored 3-vector to stored alm: the old files
-# cannot be read as the new format, so they must not share a directory.
-_config = ("v2", L_OUT, LMIN, LMAX, MLMAX, round(RES, 12), NOISE_UK_ARCMIN,
-           round(float(POL_NOISE_FACTOR), 12), BEAM_FWHM_ARCMIN,
-           MASK_KEY, round(float(BETA), 12),
-           tuple(round(float(x), 12) for x in np.asarray(BDIR).ravel()))
-if args.seed_offset:
-    _config = _config + ("seed", args.seed_offset)
-
-_seed_tag = f"_seed{args.seed_offset}" if args.seed_offset else ""
-CACHE_DIR = os.path.join(
-    args.cache,
-    f"{MASK_KEY}_lmax{LMAX}{_seed_tag}_"
-    + hashlib.md5(repr(_config).encode()).hexdigest()[:8])
-os.makedirs(CACHE_DIR, exist_ok=True)
-PLOT_DIR = args.plot_dir or os.path.join(CACHE_DIR, "plots")
+# CACHE_DIR and PLOT_DIR are built at the end of section 4, once the mask
+# exists: the dr6 mask comes from a file rather than from the arguments, so
+# the only honest way to key the cache on it is to hash the mask itself.
 
 
 def l1_vector(packed):
@@ -322,69 +416,33 @@ RESPONSE_DIRS = [(0.0, 0.0),           # x
 
 # CAMB, Filters, Noise, and Normalization
 
-# CAMB and tempura together take a couple of minutes and depend only on the
-# multipole range and the noise, not on any sim.  Every shard was repeating
-# them, and so was the final collection pass that only wants to print a
-# report.  Cache both, keyed on exactly what they depend on.
-THEORY_KEY = hashlib.md5(repr(
-    (LMIN, LMAX, MLMAX, L_OUT, NOISE_UK_ARCMIN,
-     round(float(POL_NOISE_FACTOR), 12), BEAM_FWHM_ARCMIN,
-     tuple(ESTIMATORS))).encode()).hexdigest()[:10]
-THEORY_PATH = os.path.join(args.cache, f"theory_{THEORY_KEY}.npz")
+print("theory spectra from CAMB ...", flush=True)
+pars = camb.set_params(H0=67.5, ombh2=0.022, omch2=0.122,
+                       ns=0.965, As=2.1e-9, tau=0.06)
+# lens_potential_accuracy is only wanted for the C_L^phiphi reference curve on
+# the leakage plot; it does not feed the sims.
+pars.set_for_lmax(MLMAX + 500, lens_potential_accuracy=1)
 
+# Note: unlensed right now, something to check in future
+camb_results = camb.get_results(pars)
+camb_cls = camb_results.get_cmb_power_spectra(
+    pars, raw_cl=True, spectra=["unlensed_scalar"])["unlensed_scalar"]
 
-def _load_theory():
-    """Cached spectra and norms, or None if absent or unreadable."""
-    if not os.path.exists(THEORY_PATH):
-        return None
-    try:
-        with np.load(THEORY_PATH) as f:
-            d = {k: f[k] for k in f.files}
-    except Exception as exc:                              # noqa: BLE001
-        print(f"   (theory cache unreadable, recomputing: {exc})")
-        return None
-    need = {"cltt", "clee", "clbb", "clte", "CLPP"}
-    need |= {f"AL_{e}" for e in ESTIMATORS}
-    return d if need <= set(d) else None
+cltt = camb_cls[:MLMAX + 1, 0].copy()
+clee = camb_cls[:MLMAX + 1, 1].copy()
+clbb = camb_cls[:MLMAX + 1, 2].copy()    # BB is not used
+clte = camb_cls[:MLMAX + 1, 3].copy()
 
-
-_th = _load_theory()
-
-if _th is not None:
-    print(f"theory reloaded from {THEORY_PATH}", flush=True)
-    cltt, clee = _th["cltt"], _th["clee"]
-    clbb, clte = _th["clbb"], _th["clte"]
-    CLPP = _th["CLPP"]
-    AL = {e: _th[f"AL_{e}"] for e in ESTIMATORS}
-else:
-    print("theory spectra from CAMB ...", flush=True)
-    pars = camb.set_params(H0=67.5, ombh2=0.022, omch2=0.122,
-                           ns=0.965, As=2.1e-9, tau=0.06)
-    # lens_potential_accuracy is only wanted for the C_L^phiphi reference curve
-    # on the leakage plot; it does not feed the sims.
-    pars.set_for_lmax(MLMAX + 500, lens_potential_accuracy=1)
-
-    # Note: unlensed right now, something to check in future
-    camb_results = camb.get_results(pars)
-    camb_cls = camb_results.get_cmb_power_spectra(
-        pars, raw_cl=True, spectra=["unlensed_scalar"])["unlensed_scalar"]
-
-    cltt = camb_cls[:MLMAX + 1, 0].copy()
-    clee = camb_cls[:MLMAX + 1, 1].copy()
-    clbb = camb_cls[:MLMAX + 1, 2].copy()    # BB is not used
-    clte = camb_cls[:MLMAX + 1, 3].copy()
-
-    # Real lensing power at the same low L, as a yardstick for the leakage.
-    try:
-        _pp = camb_results.get_lens_potential_cls(lmax=max(L_OUT, 10))[:, 0]
-        CLPP = np.zeros(L_OUT + 1)
-        _l = _ELLS[1:].astype(float)
-        CLPP[1:] = 2.0 * np.pi * _pp[1:L_OUT + 1] / (_l * (_l + 1.0)) ** 2
-        CLPP[~np.isfinite(CLPP)] = 0.0
-    except Exception as exc:                              # noqa: BLE001
-        print(f"   (no lensing potential for the reference curve: {exc})")
-        CLPP = np.zeros(L_OUT + 1)
-    AL = None                          # filled in after the filters are built
+# Real lensing power at the same low L, purely as a yardstick for the leakage.
+try:
+    _pp = camb_results.get_lens_potential_cls(lmax=max(L_OUT, 10))[:, 0]
+    CLPP = np.zeros(L_OUT + 1)
+    _l = _ELLS[1:].astype(float)
+    CLPP[1:] = 2.0 * np.pi * _pp[1:L_OUT + 1] / (_l * (_l + 1.0)) ** 2
+    CLPP[~np.isfinite(CLPP)] = 0.0
+except Exception as exc:                                  # noqa: BLE001
+    print(f"   (no lensing potential for the reference curve: {exc})")
+    CLPP = np.zeros(L_OUT + 1)
 
 # Noise, converted from uK-arcmin into the same dimensionless units.
 noise_rms = NOISE_UK_ARCMIN * utils.arcmin / TCMB_UK
@@ -433,6 +491,10 @@ filt_B = inverse_variance_filter(tcls["BB"])
 # returns [gradient, curl]; aberration is a pure gradient, so we take index 0.
 # Unlike before we keep the whole low-L array, not just L = 1: the leakage at
 # L >= 2 has to be normalised at its own L to mean anything.
+print("normalisations from tempura ...", flush=True)
+Als = pytempura.get_norms(ESTIMATORS, ucls, ucls, tcls, LMIN, LMAX, k_ellmax=MLMAX)
+
+
 def _safe_norm(a):
     """A_L with anything unusable (L=0, zeros, nans) pushed to infinity."""
     a = np.asarray(a, dtype=float).copy()
@@ -441,23 +503,7 @@ def _safe_norm(a):
     return a
 
 
-if AL is None:
-    print("normalisations from tempura ...", flush=True)
-    Als = pytempura.get_norms(ESTIMATORS, ucls, ucls, tcls,
-                              LMIN, LMAX, k_ellmax=MLMAX)
-    AL = {e: _safe_norm(np.asarray(Als[e][0])[:L_OUT + 1]) for e in ESTIMATORS}
-    # Written atomically, so shards racing to create it cannot corrupt it;
-    # they just duplicate the work once.  --prepare avoids even that.
-    _tmp = f"{THEORY_PATH}.tmp{os.getpid()}.npz"
-    np.savez(_tmp, cltt=cltt, clee=clee, clbb=clbb, clte=clte, CLPP=CLPP,
-             **{f"AL_{e}": AL[e] for e in ESTIMATORS})
-    os.replace(_tmp, THEORY_PATH)
-    print(f"   cached to {THEORY_PATH}", flush=True)
-
-if args.prepare:
-    print("theory ready; exiting before any sims (--prepare)")
-    raise SystemExit(0)
-
+AL = {e: _safe_norm(np.asarray(Als[e][0])[:L_OUT + 1]) for e in ESTIMATORS}
 A1 = {e: float(AL[e][1]) for e in ESTIMATORS}       # the value at L = 1
 if not all(np.isfinite(v) for v in A1.values()):
     raise RuntimeError("tempura gave no usable normalisation at L = 1")
@@ -545,12 +591,108 @@ RA_HALFWIDTH = (solve_ra_halfwidth(args.fsky) if args.mask == "act"
                 else float("nan"))
 
 
+# --- the released ACT DR6 mask ----------------------------------------------
+# Projecting nside 4096 onto the CAR grid costs a ~0.8 GB read and a minute or
+# so, which is wasteful once per run and actively bad once per shard, so the
+# projected mask is cached next to the sims.  W_NATIVE holds w1, w2, w4 of the
+# healpix mask itself: healpix pixels are equal area, so the plain mean of
+# mask**n is exact, and comparing it with the CAR values says whether the
+# resolution is fine enough for the source holes.
+DR6_W_NATIVE = None
+
+
+def _dr6_cache_paths():
+    """Where the projected mask and its native w factors are kept."""
+    d = os.path.join(args.cache, "masks")
+    os.makedirs(d, exist_ok=True)
+    key = (f"{os.path.basename(DR6_PATH)}_{os.path.getsize(DR6_PATH)}"
+           f"_n{DR6_NSIDE}_res{RES:.12g}_sm{args.dr6_smooth_arcmin:g}")
+    base = os.path.join(
+        d, f"dr6_{args.dr6_variant}_"
+           + (f"n{DR6_NSIDE}" if DR6_NSIDE else "native")
+           + f"_{hashlib.md5(key.encode()).hexdigest()[:10]}")
+    return base + ".fits", base + "_w.npy"
+
+
+def load_dr6_mask():
+    """The released DR6 lensing mask, projected onto this CAR geometry."""
+    global DR6_W_NATIVE
+    car_path, w_path = _dr6_cache_paths()
+    if os.path.exists(car_path) and os.path.exists(w_path):
+        cached = enmap.read_map(car_path)
+        if tuple(cached.shape[-2:]) == tuple(shape[-2:]):
+            print(f"DR6 mask: reusing {car_path}", flush=True)
+            DR6_W_NATIVE = np.load(w_path)
+            return cached
+        # Belt and braces: RES is already in the cache key, so this should
+        # not happen unless the geometry convention itself changed.
+        print(f"DR6 mask: cached projection is {tuple(cached.shape[-2:])} but "
+              f"this run wants {tuple(shape[-2:])}; rebuilding", flush=True)
+        del cached
+
+    print(f"DR6 mask: reading {DR6_PATH}", flush=True)
+    t0 = time.time()
+    # nest=False makes healpy reorder a NESTED file for us; the spline
+    # projection below assumes RING.
+    m = hp.read_map(DR6_PATH, field=0, dtype=np.float32)
+    m = np.clip(np.nan_to_num(m), 0.0, 1.0)
+    nside_in = hp.npix2nside(m.size)
+    print(f"   nside {nside_in}, {m.size} pixels, "
+          f"{time.time() - t0:.1f} s", flush=True)
+
+    if args.dr6_smooth_arcmin > 0:
+        print(f"   smoothing by {args.dr6_smooth_arcmin:g} arcmin FWHM "
+              f"(this is an SHT at nside {nside_in}, be patient)", flush=True)
+        m = np.clip(hp.smoothing(m.astype(np.float64),
+                                 fwhm=args.dr6_smooth_arcmin * utils.arcmin),
+                    0.0, 1.0).astype(np.float32)
+
+    # Exact, and the reference the CAR mask is judged against.
+    DR6_W_NATIVE = np.array([float(np.mean(m.astype(np.float64) ** n))
+                             for n in (1, 2, 4)])
+
+    if DR6_NSIDE and DR6_NSIDE != nside_in:
+        # ud_grade averages, so w1 is preserved exactly and the sub-pixel
+        # structure is turned into partial weights rather than point samples.
+        print(f"   averaging down to nside {DR6_NSIDE}", flush=True)
+        m = hp.ud_grade(m, DR6_NSIDE).astype(np.float32)
+
+    if not hasattr(reproject, "healpix2map"):
+        raise RuntimeError("this pixell has no reproject.healpix2map; "
+                           "upgrade pixell")
+    t0 = time.time()
+    # method="spline" rather than the default "harm": harmonic interpolation
+    # rings around the edges and the holes and can put small negative values
+    # into a mask that is then squared and fourth-powered.  rot=None because
+    # the released mask is already equatorial - do not let it default to
+    # "gal,equ" as the older reproject helpers did.
+    car = reproject.healpix2map(m, shape=shape, wcs=wcs, method="spline",
+                                order=1, spin=[0], rot=None)
+    del m
+    print(f"   projected onto {shape[0]} x {shape[1]} CAR in "
+          f"{time.time() - t0:.1f} s", flush=True)
+
+    out = enmap.enmap(np.clip(np.asarray(car, dtype=np.float64), 0.0, 1.0),
+                      wcs)
+    del car
+    # Temp-then-rename, so two shards starting at once cannot leave a half
+    # written mask behind for the third one to read.
+    tmp = f"{car_path}.tmp{os.getpid()}.fits"
+    enmap.write_map(tmp, out)
+    os.replace(tmp, car_path)
+    np.save(w_path, DR6_W_NATIVE)
+    print(f"   cached as {car_path}", flush=True)
+    return out
+
+
 def build_mask():
     """1 where the sky is kept, 0 where it is cut."""
     w = APOD
     ones = np.ones(shape[1])
     if args.mask == "none":
         keep = np.outer(np.ones(shape[0]), ones)
+    elif args.mask == "dr6":
+        return load_dr6_mask()             # already an enmap on this geometry
     elif args.mask == "act":
         td, tr = _act_parts(RA_HALFWIDTH)
         keep = np.outer(td, tr)
@@ -580,6 +722,49 @@ def w_factor(n):
 
 
 w1, w2, w4 = (w_factor(n) for n in (1, 2, 4))
+
+# A helper for the report: is the boost direction actually inside the patch?
+def mask_at(ra, dec):
+    """Mask value at one equatorial position, radians."""
+    pos = np.array([[dec], [ra]])
+    try:
+        return float(np.asarray(mask.at(pos, order=1)).ravel()[0])
+    except Exception:                                      # noqa: BLE001
+        y, x = enmap.sky2pix(shape, wcs, pos)
+        return float(np.asarray(mask)[int(round(y[0])) % shape[0],
+                                      int(round(x[0])) % shape[1]])
+
+
+# The cache stores reconstructions, which depend on every setting above.  Keying
+# the directory on those settings means a run with a different mask, lmax or
+# noise level can never silently reload the wrong sims.  Change any of them and
+# you get a fresh directory; change nothing and the old results are reused.
+# "v2" marks the switch from a stored 3-vector to stored alm: the old files
+# cannot be read as the new format, so they must not share a directory.
+_config = ("v2", L_OUT, LMIN, LMAX, MLMAX, round(RES, 12), NOISE_UK_ARCMIN,
+           round(float(POL_NOISE_FACTOR), 12), BEAM_FWHM_ARCMIN,
+           MASK_KEY, round(float(BETA), 12),
+           tuple(round(float(x), 12) for x in np.asarray(BDIR).ravel()))
+if args.seed_offset:
+    _config = _config + ("seed", args.seed_offset)
+
+# MASK_KEY names the analytic masks completely, but the dr6 mask comes out of a
+# file, so hash the mask itself: a re-downloaded or edited file, or a different
+# variant left under the same name, then cannot silently reuse these sims.
+# Appended only for dr6, so every other mask hashes exactly as it did before
+# this option existed and the existing caches stay reachable.
+MASK_DIGEST = hashlib.md5(
+    np.ascontiguousarray(np.asarray(mask, dtype=np.float64))).hexdigest()[:8]
+if args.mask == "dr6":
+    _config = _config + ("dr6", MASK_DIGEST)
+
+_seed_tag = f"_seed{args.seed_offset}" if args.seed_offset else ""
+CACHE_DIR = os.path.join(
+    args.cache,
+    f"{MASK_KEY}_lmax{LMAX}{_seed_tag}_"
+    + hashlib.md5(repr(_config).encode()).hexdigest()[:8])
+os.makedirs(CACHE_DIR, exist_ok=True)
+PLOT_DIR = args.plot_dir or os.path.join(CACHE_DIR, "plots")
 
 
 # 5. Simulation and Reconstruction
@@ -1015,7 +1200,6 @@ def analyse(case, mf_vecs, diffs, data_vecs):
               f"    (expect 0)")
 
     return dict(sigma=sigma, amp=amps, dir=dirs, vel=vel, R=R,
-                velraw=-(dat - mf) * C_KMS, naive=naive,
                 leak=(leak["cl"] if leak else np.zeros(L_OUT + 1)),
                 leakerr=(leak["err"] if leak else np.zeros(L_OUT + 1)),
                 noise=noise, mfcl=mfcl, datleak=datleak, n_dat=n_dat,
@@ -1085,6 +1269,37 @@ def main():
               f"ra {args.ra_center - RA_HALFWIDTH:.1f} to "
               f"{args.ra_center + RA_HALFWIDTH:.1f} "
               f"({w1 * 41253:.0f} deg^2)")
+    if args.mask == "dr6":
+        print(f"                 {os.path.basename(DR6_PATH)}")
+        print(f"                 variant {args.dr6_variant}, projected from "
+              f"nside {DR6_NSIDE or 'native'}"
+              + (f", smoothed {args.dr6_smooth_arcmin:g} arcmin"
+                 if args.dr6_smooth_arcmin > 0 else "")
+              + f", digest {MASK_DIGEST}")
+        print(f"                 {w1 * 41253:.0f} deg^2, "
+              f"sqrt(w4)/w2 {np.sqrt(w4) / w2:.3f} "
+              f"(the penalty on sigma_A relative to the full sky)")
+        if DR6_W_NATIVE is not None:
+            print(f"                 healpix w1 {DR6_W_NATIVE[0]:.4f}, "
+                  f"w2 {DR6_W_NATIVE[1]:.4f}, w4 {DR6_W_NATIVE[2]:.4f}"
+                  f"  ->  CAR is "
+                  + ", ".join(
+                      f"{100 * (c / n - 1):+.2f}%" for c, n in
+                      zip((w1, w2, w4), DR6_W_NATIVE))
+                  + " in w1, w2, w4")
+            worst = max(abs(c / n - 1) for c, n in
+                        zip((w1, w2, w4), DR6_W_NATIVE))
+            if worst > 0.01:
+                print(f"                 WARNING: {100 * worst:.1f}% off the "
+                      f"exact healpix value.  {RES / utils.arcmin:.2f} arcmin "
+                      f"pixels are not\n                 resolving the source "
+                      f"holes; try a smaller --res (and a larger --dr6-nside)")
+    _m_dip = mask_at(BDIR[0], BDIR[1])
+    print(f"                 mask at the boost direction = {_m_dip:.3f}")
+    if _m_dip < 0.05:
+        print(f"                 WARNING: the dipole direction is outside the "
+              f"footprint.  R will be\n                 badly conditioned "
+              f"along it and A is close to meaningless")
     print(f"sims           = {N_MEANFIELD} mean field, {N_RESPONSE} response, "
           f"{N_DATA} data "
           f"({N_MEANFIELD + N_DATA + N_RESPONSE * (4 if not RESPONSE_CENTRAL else 6)}"
@@ -1133,15 +1348,24 @@ def write_summary(results):
                n_data=results[cases[0]]["n_dat"], lmax=int(LMAX),
                lout=int(L_OUT), mask_key=np.array(MASK_KEY),
                fsky_target=float(args.fsky),
-               patch=(np.array([ACT_DEC[0], ACT_DEC[1],
-                                args.ra_center - RA_HALFWIDTH,
-                                args.ra_center + RA_HALFWIDTH])
-                      if args.mask == "act" else np.full(4, np.nan)))
+               mask_kind=np.array(args.mask),
+               mask_digest=np.array(MASK_DIGEST),
+               mask_file=np.array(os.path.basename(DR6_PATH)
+                                  if DR6_PATH else ""),
+               mask_variant=np.array(args.dr6_variant
+                                     if args.mask == "dr6" else ""),
+               dr6_nside=int(DR6_NSIDE),
+               w_native=(DR6_W_NATIVE if DR6_W_NATIVE is not None
+                         else np.full(3, np.nan)),
+               mask_at_dipole=float(mask_at(BDIR[0], BDIR[1])),
+               res_arcmin=float(RES / utils.arcmin))
     for k, case in enumerate(cases):
         r = results[case]
-        for key in ("vel", "velraw", "amp", "naive", "dir", "R", "leak",
-                    "leakerr", "noise", "mfcl", "datleak"):
-            out[f"{key}_{k}"] = np.asarray(r[key])
+        for name, key in (("vel", "vel"), ("amp", "amp"), ("dir", "dir"),
+                          ("R", "R"), ("leak", "leak"), ("leakerr", "leakerr"),
+                          ("noise", "noise"), ("mfcl", "mfcl"),
+                          ("datleak", "datleak")):
+            out[f"{name}_{k}"] = np.asarray(r[key])
     path = os.path.join(CACHE_DIR, "summary.npz")
     np.savez(path, **out)
     print(f"\nwrote {path}")
@@ -1150,8 +1374,8 @@ def write_summary(results):
         return
     try:
         import aberration_plots
-        summary = aberration_plots.load(path, list(CASES)[-1])
-        for f in aberration_plots.make_all(summary, PLOT_DIR):
+        for f in aberration_plots.make_all(aberration_plots.load(path),
+                                           PLOT_DIR):
             print(f"wrote {f}")
     except Exception as exc:                               # noqa: BLE001
         print(f"figures skipped ({exc}); rerun with\n"
