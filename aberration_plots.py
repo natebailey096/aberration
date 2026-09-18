@@ -24,7 +24,9 @@ Figures
   amplitude_direction amplitude before and after correction - the one place
                       the uncorrected estimator is drawn - and the recovered
                       directions
-  leakage_spectrum    coherent power the L=1 boost leaves at L >= 2
+  leakage_spectrum    coherent power the boost leaves at each L out to
+                      LEAK_LMAX, measured from the aberrated data sims
+                      (mean field subtracted)
 
 Sky maps are drawn with RA increasing to the left, the usual convention, and
 the tick labels are built from the axis values rather than typed out, since a
@@ -75,6 +77,12 @@ STAR = "#FFD400"         # the dipole marker, so it shows on a dark map
 INK = "#1A1A1A"
 GRID = "0.75"
 COMPONENTS = [r"$v_x$", r"$v_y$", r"$v_z$"]
+
+# Highest L drawn on the leakage figure.  The pipeline reconstructs out to
+# --lout (20 by default), but the data-sim estimator is noise dominated well
+# before that, so the extra decade of scatter only makes the figure harder to
+# read.  Raise it if a run resolves leakage further out.
+LEAK_LMAX = 10
 
 
 def _style():
@@ -649,84 +657,73 @@ def plot_amplitude(S, path):
 
 
 def plot_leakage(S, path):
-    """Spurious power the L=1 boost puts at L>=2, against what else lives there."""
+    """Spurious power the boost leaves at each L, from the aberrated sims.
+
+    One panel, L = 1 to LEAK_LMAX, one series: datleak, the mean of the
+    aberrated data sims with the mean field subtracted and the Monte Carlo
+    variance of both removed.
+
+    That estimator is a difference of two noisy means, so it can come out
+    negative wherever the leakage is below the noise.  If every point drawn is
+    positive the axis is a plain log; if any is not, it switches to symlog so
+    the negative ones can be seen, with the linear region set just wide enough
+    to hold the smallest point.  Negative points are drawn open so the sign
+    survives in greyscale and in print.
+    """
     _style()
     ells = np.asarray(S["ells"], int)
-    beta = float(_scalar(S, "beta"))
-    c1_in = 4 * np.pi * beta ** 2 / 9.0        # C_1 of the input dipole
-    m = ells >= 1
-    leak = np.asarray(S["leak"], float)
-    err = np.asarray(S["leakerr"], float)
-    noise = np.asarray(S["noise"], float)
-    mfcl = np.asarray(S["mfcl"], float)
-    datleak = np.asarray(S["datleak"], float)
-    clpp = np.asarray(S.get("clpp", np.zeros_like(ells, float)), float)
+    dat = np.asarray(S["datleak"], float)
 
-    fig, (ax0, ax1) = plt.subplots(
-        2, 1, figsize=(8.4, 7.4), sharex=True,
-        gridspec_kw=dict(height_ratios=[1.6, 1.0], hspace=0.09))
+    m = (ells >= 1) & (ells <= LEAK_LMAX) & np.isfinite(dat)
+    if m.sum() < 2:
+        raise ValueError("summary.npz has no usable datleak")
+    L, y = ells[m], dat[m]
 
-    seen = np.concatenate([leak[m], noise[m], mfcl[m], clpp[m]])
-    seen = seen[np.isfinite(seen) & (seen > 0)]
-    top = 10 ** np.ceil(np.log10(max(seen.max() if seen.size else c1_in,
-                                     c1_in)) + 0.3)
-    floor = top * 1e-7
+    fig, ax = plt.subplots(figsize=(7.6, 5.2))
 
-    det = np.isfinite(err) & (leak > 2 * err)      # resolved above MC noise
-    y = np.clip(np.where(det, leak,
-                         np.where(np.isfinite(err), 2 * err, top)), floor, top)
-    ax0.plot(ells[m], y[m], "-", lw=1.8, color=COR, label="leakage (response)")
-    ax0.plot(ells[det & m], np.clip(leak[det & m], floor, top), "o", ms=4.5,
-             color=COR)
-    ax0.fill_between(ells[m], np.clip((leak - err)[m], floor, top),
-                     np.clip((leak + err)[m], floor, top), where=det[m],
-                     color=COR, alpha=0.2, lw=0)
-    u = (~det) & m
-    if u.any():
-        ax0.plot(ells[u], y[u], "v", ms=5.0, mfc="none", color=COR,
-                 ls="none", label="2$\\sigma$ upper limit")
-    dm = m & (datleak > 0)
-    ax0.plot(ells[dm], np.clip(datleak[dm], floor, top), "s", ms=4.0,
-             mfc="none", color=RAW, ls="none", label="leakage (data sims)")
-    ax0.plot(ells[m], noise[m], ls=(0, (4, 2)), lw=1.5, color="0.3",
-             label="recon. noise $N_L$")
-    ax0.plot(ells[m], np.clip(mfcl[m], floor, top), ls=(0, (1, 1.6)), lw=1.5,
-             color="0.6", label="mean field")
-    if np.any(clpp > 0):
-        ax0.plot(ells[m], np.clip(clpp[m], floor, top), lw=1.8, color=TRUTH,
-                 label=r"lensing $C_L^{\phi\phi}$")
-    ax0.axhline(c1_in, color=INK, lw=1.0, ls=":")
-    ax0.text(ells[m][-1], c1_in, "input dipole $C_1$ ", va="bottom",
-             ha="right", fontsize=9, color=INK)
+    pos, neg = y > 0, y <= 0
+    ax.plot(L, y, "-", lw=1.6, color=COR, alpha=0.8, zorder=2)
+    ax.plot(L[pos], y[pos], "o", ms=6.5, color=COR, mec=INK, mew=0.6,
+            ls="none", zorder=4, label="positive")
+    if neg.any():
+        ax.plot(L[neg], y[neg], "o", ms=6.5, mfc="white", mec=COR, mew=1.5,
+                ls="none", zorder=4, label="negative after debiasing")
 
-    ax0.set_yscale("log")
-    ax0.set_ylim(floor, top)
-    ax0.set_ylabel(r"$C_L$  [dimensionless $\phi$]")
-    ax0.set_title("coherent power the $L=1$ boost leaves at higher $L$",
-                  pad=12)
-    ax0.legend(ncol=2, fontsize=9, loc="lower left", frameon=True,
-               framealpha=0.9, borderpad=0.6, columnspacing=1.3,
-               handlelength=1.7)
+    small, big = np.abs(y[y != 0]).min(), np.abs(y).max()
+    if neg.any():
+        # Four decades below the largest point, or the smallest point if that
+        # is larger.  Taking the smallest point itself would squeeze the
+        # linear region to nothing and pile the 0 tick on top of its
+        # neighbours; anything below the threshold is noise either way.
+        lt = max(small, big * 1e-4)
+        ax.axhline(0.0, color="0.55", lw=1.0, zorder=1)
+        ax.set_yscale("symlog", linthresh=lt, linscale=0.7)
+        ax.set_ylim(min(-3.0 * lt, 1.8 * y.min()), 4.0 * max(y.max(), lt))
+        # Ticks written out rather than left to the automatic locator, which
+        # puts decades inside the linear region as well and lands them on top
+        # of the 0 label.  One per decade from the threshold outward, plus 0.
+        lo, hi = ax.get_ylim()
+        e0 = int(np.ceil(np.log10(lt)))
+        e1 = int(np.ceil(np.log10(max(abs(lo), abs(hi)))))
+        ticks = [0.0] + [s * 10.0 ** e for e in range(e0, e1 + 1)
+                         for s in (1, -1) if lo <= s * 10.0 ** e <= hi]
+        ax.set_yticks(sorted(ticks))
+        ax.legend(fontsize=9.5, loc="upper right", frameon=True,
+                  framealpha=0.9, borderpad=0.6).set_zorder(6)
+    else:
+        ax.set_yscale("log")
+        ax.set_ylim(small / 3.0, big * 4.0)
 
-    ref = leak[1] if leak[1] > 0 else np.nan
-    with np.errstate(invalid="ignore"):
-        r = 100 * np.where(det, leak,
-                           np.where(np.isfinite(err), 2 * err, np.nan)) / ref
-    sel = m.copy()
-    sel[1] = False
-    ax1.plot(ells[sel], r[sel], "-", lw=1.6, color=COR)
-    ax1.plot(ells[sel & det], r[sel & det], "o", ms=4.5, color=COR)
-    ax1.plot(ells[sel & ~det], r[sel & ~det], "v", ms=5.0, mfc="none",
-             color=COR, ls="none")
-    rr = r[sel]
-    rr = rr[np.isfinite(rr) & (rr > 0)]
-    if rr.size:
-        ax1.set_yscale("log")
-        ax1.set_ylim(rr.min() / 3.0, rr.max() * 3.0)
-    ax1.set_ylabel(r"leakage / recovered $L=1$  [%]")
-    ax1.set_xlabel(r"multipole $L$ of the reconstruction")
-    ax1.set_xlim(0.6, ells[-1] + 0.4)
-    ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.set_xlim(0.6, L[-1] + 0.4)
+    ax.set_xticks(L)
+    ax.set_xlabel(r"multipole $L$ of the reconstruction")
+    ax.set_ylabel(r"$C_L$]")
+    ax.set_title(f"{S['case']}:  power the boost leaves at each $L$,\n"
+                 f"from {int(_scalar(S, 'n_data', 0)) or 'the'} aberrated "
+                 f"sims", fontsize=11.5, linespacing=1.4)
+    ax.grid(True, which="major", color=GRID, lw=0.6, alpha=0.35)
+    ax.grid(True, which="minor", axis="y", color=GRID, lw=0.4, alpha=0.18)
+
     fig.savefig(path)
     plt.close(fig)
     return path
