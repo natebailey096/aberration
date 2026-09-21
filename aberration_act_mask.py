@@ -1,5 +1,27 @@
 """
 Reconstruction of the CMB aberration dipole with a lensing quadratic estimator.
+
+Defaults: lmax 3000 at 3 arcmin resolution, reconstruction kept out to L = 5.
+
+The released ACT DR6 healpix mask is put onto the CAR grid with
+pixell.reproject.healpix2map(..., method="spline"), which reads the healpix map
+at each CAR pixel centre by bilinear interpolation.  That is the right choice
+for a mask: the result is a convex combination of nearby input values, so it
+cannot leave [0, 1], where the harmonic method rings around the sharp edges of
+a footprint and drives an all-positive mask negative.  --dr6-method harm and
+--dr6-method average (the old area-average binning) are kept so the three can
+be compared on the same run; the printed w1, w2, w4 ratios are where to look.
+
+The response is measured with boosts along x, y and z, and reported two ways
+from exactly the same paired sims:
+
+  * the 3x3 matrix R, which is the L = 1 part, and
+  * the (L, M) response <a_LM> / (-beta) at every L out to --lout, printed as
+    the coefficients themselves rather than collapsed into a power spectrum.
+
+The second contains the first: taking the L = 1 rows of the alm response back
+through l1_vector returns R exactly, which is why both come out of one array.
+Everything above L = 1 is the leakage the boost leaves behind.
 """
 
 import os
@@ -57,7 +79,7 @@ import numpy as np
 import healpy as hp
 import camb
 
-from pixell import enmap, curvedsky, aberration, utils
+from pixell import enmap, curvedsky, aberration, reproject, utils
 from falafel import qe
 import pytempura
 
@@ -74,15 +96,31 @@ parser.add_argument("--noise", type=float, default=10.0,
                     help="white noise in T, uK-arcmin")
 parser.add_argument("--pol-noise-factor", type=float, default=np.sqrt(2.0))
 parser.add_argument("--beam", type=float, default=0.0, help="FWHM in arcmin")
-parser.add_argument("--lmax", type=int, default=2000)
-parser.add_argument("--res", type=float, default=None, help="arcmin")
-parser.add_argument("--lout", type=int, default=20,
-                    help="highest reconstruction multipole kept")
+parser.add_argument("--lmax", type=int, default=3000)
+parser.add_argument("--res", type=float, default=3.0,
+                    help="arcmin; pass 0 for the finest resolution "
+                         "that still band-limits mlmax safely")
+parser.add_argument("--lout", type=int, default=5,
+                    help="highest reconstruction multipole kept.  The "
+                         "alm response is reported over all of it")
 parser.add_argument("--mask", default="act",
                     choices=["none", "box", "dec_band", "act", "dr6"])
 parser.add_argument("--dr6-mask", default=None)
 parser.add_argument("--dr6-variant", default="baseline")
 parser.add_argument("--dr6-smooth-arcmin", type=float, default=0.0)
+parser.add_argument("--dr6-method", default="spline",
+                    choices=["spline", "harm", "average"],
+                    help="healpix -> CAR interpolation.  spline is "
+                         "pixell's recommendation for masks and "
+                         "hitcounts; harm rings around sharp edges; "
+                         "average is the old area-average binning, "
+                         "kept as a cross-check")
+parser.add_argument("--dr6-order", type=int, default=1, choices=[0, 1],
+                    help="spline order: 1 bilinear, 0 nearest")
+parser.add_argument("--dr6-rot", default=None,
+                    help="coordinate rotation for the healpix file, "
+                         "e.g. gal,cel.  The DR6 masks are already "
+                         "equatorial, so the default is none")
 parser.add_argument("--fsky", type=float, default=0.2,
                     help="for --mask act: target w1")
 parser.add_argument("--act-dec", type=float, nargs=2, default=[-60.0, 22.0])
@@ -116,7 +154,7 @@ args = parser.parse_args()
 LMIN = 2
 LMAX = args.lmax
 MLMAX = LMAX + 500
-if args.res is not None:
+if args.res and args.res > 0:
     RES = args.res * utils.arcmin
 else:
     RES = min(4.0, 10800.0 / (1.08 * MLMAX)) * utils.arcmin
@@ -188,7 +226,11 @@ DR6_NSIDE = 0
 if args.mask == "none":
     MASK_KEY = "none"
 elif args.mask == "dr6":
-    MASK_KEY = f"dr6_{args.dr6_variant}"
+    MASK_KEY = f"dr6_{args.dr6_variant}_{args.dr6_method}"
+    if args.dr6_method == "spline":
+        MASK_KEY += str(args.dr6_order)
+    if args.dr6_rot:
+        MASK_KEY += "_" + args.dr6_rot.replace(",", "2")
     if args.dr6_smooth_arcmin > 0:
         MASK_KEY += f"_sm{args.dr6_smooth_arcmin:g}"
 elif args.mask == "act":
@@ -420,6 +462,17 @@ for case in CASES:
 shape, wcs = enmap.fullsky_geometry(res=RES)
 px = qe.pixelization(shape=shape, wcs=wcs)
 
+# fullsky_geometry defaults to the fejer1 variant, whose quadrature is exact up
+# to lmax = ny - 1.  At the default 3 arcmin that is 3599, comfortably above
+# mlmax = 3500, but --res and --lmax move independently, so say so rather than
+# letting an under-resolved grid quietly alias power into the reconstruction.
+_LMAX_GRID = shape[0] - 1
+if MLMAX > _LMAX_GRID:
+    print(f"WARNING: mlmax {MLMAX} exceeds what a {RES / utils.arcmin:.2f} "
+          f"arcmin grid holds ({_LMAX_GRID}).\n"
+          f"         Use --res {10800.0 / MLMAX:.2f} or finer, or lower "
+          f"--lmax.", flush=True)
+
 # A CAR geometry is separable, so the 1-D axes are enough to build the mask and
 # to integrate it exactly.  That avoids three full-sky float64 maps.
 _dec_ax, _ra_ax = enmap.posaxes(shape, wcs)
@@ -433,6 +486,12 @@ _dra = abs(wcs.wcs.cdelt[0]) * utils.degree
 ROW_AREA = _dra * (np.sin(np.clip(_dec_ax + _ddec / 2, -np.pi / 2, np.pi / 2))
                    - np.sin(np.clip(_dec_ax - _ddec / 2,
                                     -np.pi / 2, np.pi / 2)))
+
+
+def _w_factor_of(m, n):
+    """<W^n> over the sphere, for any mask on this CAR geometry."""
+    row_mean = (np.asarray(m, dtype=np.float64) ** n).mean(axis=1)
+    return float(np.dot(ROW_AREA, row_mean) / ROW_AREA.sum())
 
 
 def edge_taper(x, lo, hi, width):
@@ -487,8 +546,9 @@ def dr6_cache_paths():
     d = os.path.join(args.cache, "masks")
     os.makedirs(d, exist_ok=True)
     key = (f"{os.path.basename(DR6_PATH)}_{os.path.getsize(DR6_PATH)}"
-           f"_res{RES:.12g}_sm{args.dr6_smooth_arcmin:g}")
-    name = (f"dr6_{args.dr6_variant}_bin_"
+           f"_res{RES:.12g}_sm{args.dr6_smooth_arcmin:g}"
+           f"_{args.dr6_method}_o{args.dr6_order}_rot{args.dr6_rot}")
+    name = (f"dr6_{args.dr6_variant}_{args.dr6_method}_"
             + hashlib.md5(key.encode()).hexdigest()[:10])
     base = os.path.join(d, name)
     return base + ".fits", base + "_w.npz"
@@ -513,8 +573,54 @@ def project_average(m, nside, chunk=1 << 23):
     return enmap.enmap(out.reshape(ny, nx), wcs), den.reshape(ny, nx)
 
 
+def healpix_to_car(m, nside):
+    """Healpix mask -> an enmap on this CAR geometry.
+
+    pixell's reproject.healpix2map does the work.  The default, and what the
+    released masks want, is method="spline" with order=1: it reads the input
+    map at each CAR pixel centre by bilinear interpolation, so the result is a
+    convex combination of nearby healpix values and therefore cannot leave
+    [0, 1].  method="harm" goes through spherical harmonics instead, which
+    preserves the power spectrum but rings around the sharp edges of a mask and
+    can push an all-positive input negative; it is here to be compared against,
+    not to be used.  method="average" is the old area-average binning, exact in
+    the mean but only defined where a healpix centre happens to land.
+
+    spin=[0] because this is one scalar field, not a T, Q, U triple, and
+    extensive=False because a mask is intensive: its value does not scale with
+    pixel size the way a hitcount does.
+    """
+    if args.dr6_method == "average":
+        out, den = project_average(m, nside)
+        band = np.abs(DEC_AX) < 70.0
+        note = (f"{den[band].mean():.1f} healpix centres per CAR pixel within "
+                f"|dec| < 70, {100.0 * (den == 0).mean():.2f}% of pixels empty")
+        # enmap, not a bare array: the caller writes this out with
+        # enmap.write_map, which needs the wcs to still be attached.
+        return enmap.enmap(np.asarray(out, dtype=np.float64), wcs), note
+
+    if args.dr6_method == "spline":
+        kw = dict(method="spline", order=args.dr6_order)
+        note = "bilinear" if args.dr6_order == 1 else "nearest neighbour"
+    else:
+        # No point asking for more multipoles than the output grid can hold.
+        kw = dict(method="harm", lmax=_LMAX_GRID)
+        note = f"harmonic, lmax {_LMAX_GRID}"
+
+    out = reproject.healpix2map(m, shape, wcs, spin=[0], rot=args.dr6_rot,
+                                extensive=False, **kw)
+    out = np.asarray(out, dtype=np.float64)
+    # Says whether the interpolation stayed inside the range of the input.  For
+    # spline it has to; for harm it will not, and the size of the excursion is
+    # the ringing.  Report it before clipping it away.
+    lo, hi = float(out.min()), float(out.max())
+    frac = float(np.mean((out < -1e-6) | (out > 1.0 + 1e-6)))
+    note += f", range [{lo:+.4f}, {hi:+.4f}], {100.0 * frac:.3f}% outside [0,1]"
+    return enmap.enmap(np.clip(out, 0.0, 1.0), wcs), note
+
+
 def load_dr6_mask():
-    """The released DR6 lensing mask, binned onto this CAR geometry."""
+    """The released DR6 lensing mask, reprojected onto this CAR geometry."""
     global DR6_W_NATIVE, DR6_NSIDE
     car_path, w_path = dr6_cache_paths()
     if os.path.exists(car_path):
@@ -526,8 +632,9 @@ def load_dr6_mask():
 
     print(f"DR6 mask: reading {DR6_PATH}", flush=True)
     t0 = time.time()
-    # nest=False makes healpy reorder a NESTED file for us; pix2ang below
-    # assumes RING.
+    # nest=False makes healpy reorder a NESTED file for us, and everything
+    # downstream assumes RING: get_interp_val inside reproject's spline path,
+    # map2alm_healpix inside its harmonic one, and pix2ang in project_average.
     m = hp.read_map(DR6_PATH, field=0, dtype=np.float32)
     # The released file has UNSEEN pixels, and the mask gets squared and
     # fourth-powered later, so this clip is part of the definition.
@@ -548,19 +655,21 @@ def load_dr6_mask():
                              for n in (1, 2, 4)])
 
     t0 = time.time()
-    out, den = project_average(m, DR6_NSIDE)
+    out, note = healpix_to_car(m, DR6_NSIDE)
     del m
-    print(f"   binned onto {shape[0]} x {shape[1]} CAR in "
+    print(f"   {args.dr6_method} -> {shape[0]} x {shape[1]} CAR in "
           f"{time.time() - t0:.1f} s", flush=True)
-    # An empty CAR pixel gets 0, so these numbers say how much of the map is
-    # holes the binning punched rather than mask.  The poles are always sparse
-    # because CAR pixels shrink to nothing there; the |dec| < 70 figure is the
-    # one that matters for an equatorial footprint.  Read it before w2 and w4.
-    empty = den == 0
-    band = np.abs(DEC_AX) < 70.0
-    print(f"   {den[band].mean():.1f} healpix centres per CAR pixel within "
-          f"|dec| < 70; empty {100.0 * empty.mean():.2f}% overall, "
-          f"{100.0 * empty[band].mean():.2f}% in that band", flush=True)
+    print(f"   {note}", flush=True)
+    # The healpix w factors above are exact; these are what the CAR mask
+    # actually delivers.  A per cent or so of disagreement in w4 is the
+    # interpolation smoothing the apodised edge, not a bug, but a large gap
+    # means the grid is too coarse for the features in the mask.
+    car_w = np.array([_w_factor_of(out, n) for n in (1, 2, 4)])
+    print("   w1, w2, w4:  healpix "
+          + " ".join(f"{x:.4f}" for x in DR6_W_NATIVE)
+          + "   CAR " + " ".join(f"{x:.4f}" for x in car_w)
+          + "   ratio " + " ".join(f"{x:.4f}" for x in car_w / DR6_W_NATIVE),
+          flush=True)
 
     # Temp-then-rename: parallel shards all build this, and a half-written
     # FITS read by another shard is silent corruption.
@@ -576,7 +685,10 @@ def build_mask():
     """1 where the sky is kept, 0 where it is cut."""
     ones = np.ones(shape[1])
     if args.mask == "dr6":
-        return load_dr6_mask()             # already an enmap on this geometry
+        # Already an enmap on this geometry.  float64 because the mask gets
+        # squared and fourth-powered, and read_map hands back whatever dtype
+        # the cached FITS was written with.
+        return enmap.enmap(np.asarray(load_dr6_mask(), dtype=np.float64), wcs)
     if args.mask == "none":
         keep = np.outer(np.ones(shape[0]), ones)
     elif args.mask == "act":
@@ -597,8 +709,7 @@ mask = build_mask()
 
 def w_factor(n):
     """<W^n> over the sphere."""
-    row_mean = (np.asarray(mask) ** n).mean(axis=1)
-    return float(np.dot(ROW_AREA, row_mean) / ROW_AREA.sum())
+    return _w_factor_of(mask, n)
 
 
 w1 = w_factor(1)
@@ -979,53 +1090,83 @@ def run_response():
     return out
 
 
-def response_matrix(diffs, case):
-    """The 3x3 response and its Monte Carlo error, for one case."""
-    R = np.zeros((3, 3))
-    dR = np.zeros((3, 3))
-    for j in range(3):
-        column = diffs[j]
-        v = np.array([coadd(d, case) for d in column.values()])
-        v = v / (-RESPONSE_BETA)
-        R[:, j] = v.mean(axis=0)
-        dR[:, j] = v.std(axis=0, ddof=1) / np.sqrt(len(v))
-    return R, dR
+def response_alm(diffs, case):
+    """Per-sim (L,M) response to a boost along x, y, z.
+
+    Returns S with shape (n_sims, npack, 3).  Column j is the reconstruction
+    alm produced by a boost of beta_resp along e_j, divided by -beta_resp, so
+    that it is the response to a unit boost and carries no beta scaling of its
+    own.  The mean field cancels inside each pair before this is called.
+
+    The three columns are the same three boosts the response matrix is built
+    from, so the L=1 rows of S are the 3x3 matrix R written in the alm basis:
+    l1_vector(S[i, :, j]) is exactly column j of R for sim i.  Everything at
+    L >= 2 is the leakage the same boost leaves behind, reported as the alm
+    themselves rather than collapsed into a power spectrum.
+
+    Only sims present for all three axes are used, so that a column is never
+    averaged over a different set of realisations from its neighbours.
+    """
+    common = sorted(set(diffs[0]) & set(diffs[1]) & set(diffs[2]))
+    S = np.empty((len(common), _NPACK, 3), dtype=np.complex128)
+    for a, i in enumerate(common):
+        for j in range(3):
+            S[a, :, j] = coadd_alm(diffs[j][i], case) / (-RESPONSE_BETA)
+    return S
+
+
+def alm_response(S):
+    """Mean (L,M) response, its per-sim scatter and the error on the mean."""
+    n = len(S)
+    mean = S.mean(axis=0)
+    sd_re = S.real.std(axis=0, ddof=1)
+    sd_im = S.imag.std(axis=0, ddof=1)
+    return dict(R=mean, sd_re=sd_re, sd_im=sd_im,
+                err_re=sd_re / np.sqrt(n), err_im=sd_im / np.sqrt(n), n=n)
+
+
+def response_matrix(S):
+    """The 3x3 response, its per-sim scatter, and the error on its mean.
+
+    Read off the L=1 rows of the same S the alm response uses, so the matrix
+    and the (L,M) table can never drift apart.
+    """
+    n = len(S)
+    V = np.empty((n, 3, 3))
+    for a in range(n):
+        for j in range(3):
+            V[a, :, j] = l1_vector(S[a, :, j])
+    R = V.mean(axis=0)
+    sd = V.std(axis=0, ddof=1)
+    return R, sd, sd / np.sqrt(n)
 
 
 # 7b. Leakage into L >= 2
-# The same paired differences, read above L = 1.  Contract the three measured
-# columns with the true input vector and you have the coherent field that the
-# real boost puts on the sky, mean field already cancelled inside each pair.
+# Contract the three measured columns with the true input vector and you have
+# the coherent field the real boost puts on the sky.  This is a derived view of
+# the same S: the alm response above is the primary result, and this is the
+# single number per L that follows from it.
 
-def leakage_from_response(diffs, case):
+def leakage_from_alm(S):
     """Coherent C_L of the boost-induced signal, MC-noise debiased."""
-    common = sorted(set(diffs[0]) & set(diffs[1]) & set(diffs[2]))
-
-    rows = []
-    for i in common:
-        s = np.zeros(_NPACK, dtype=np.complex128)
-        for j in range(3):
-            s = s + A_TRUE[j] * coadd_alm(diffs[j][i], case) / (-RESPONSE_BETA)
-        rows.append(s)
-    S = np.array(rows)                          # (n, npack)
-
-    n = len(S)
-    mean = S.mean(axis=0)
-    var = (S.real.var(axis=0, ddof=1) + S.imag.var(axis=0, ddof=1)) / n
+    P = S @ A_TRUE                              # (n, npack)
+    n = len(P)
+    mean = P.mean(axis=0)
+    var = (P.real.var(axis=0, ddof=1) + P.imag.var(axis=0, ddof=1)) / n
     # <|mean|^2> = |truth|^2 + var/n, so subtract it rather than reporting a
     # leakage that is really just Monte Carlo noise.
     cl = cl_from_power(np.abs(mean) ** 2 - var)
 
     # Jackknife error bar.  Needs n >= 4 to mean anything.
-    tot = S.sum(axis=0)
+    tot = P.sum(axis=0)
     jk = np.empty((n, L_OUT + 1))
     for k in range(n):
-        rest = np.delete(S, k, axis=0)
+        rest = np.delete(P, k, axis=0)
         v_k = (rest.real.var(axis=0, ddof=1)
                + rest.imag.var(axis=0, ddof=1)) / (n - 1)
-        jk[k] = cl_from_power(np.abs((tot - S[k]) / (n - 1)) ** 2 - v_k)
+        jk[k] = cl_from_power(np.abs((tot - P[k]) / (n - 1)) ** 2 - v_k)
     err = np.sqrt((n - 1) / n * ((jk - jk.mean(axis=0)) ** 2).sum(axis=0))
-    return dict(cl=cl, err=err, n=n)
+    return dict(cl=cl, err=err, n=n, alm=mean)
 
 
 def spectra_from_sims(mf_vecs, data_vecs, case):
@@ -1089,7 +1230,8 @@ def per_estimator_meanfield(mf_vecs):
         err = A1[e] * q.std(axis=0, ddof=1).max() / np.sqrt(n) / scale
         print(f"   {e:4s}  "
               + " ".join(f"{x:+9.3f}" for x in v)
-              + f"   {np.linalg.norm(v):8.3f}   +-{err:.3f} per component")
+              + f"   {np.linalg.norm(v):8.3f}   +-{err:.3f} on the mean, "
+              f"per component")
     for case in CASES:
         if len(CASES[case]) < 2:
             continue                  # already printed above, as an estimator
@@ -1099,8 +1241,49 @@ def per_estimator_meanfield(mf_vecs):
               + f"   {np.linalg.norm(v):8.3f}")
 
 
+def report_alm_response(ar, noise):
+    """The (L,M) response to a unit boost along x, y, z, printed directly.
+
+    One block per L.  Each entry is <a_LM> / (-beta) for a boost along that
+    axis, with the Monte Carlo error on the mean beside it.  The L=1 block is
+    the response matrix in the alm basis; every block below it is leakage.
+    """
+    R, er, ei = ar["R"], ar["err_re"], ar["err_im"]
+    print(f"\n(L,M) response to a unit boost along x, y, z, from {ar['n']} "
+          f"paired sims per axis")
+    print(f"   entries are <a_LM>/(-beta); the L=1 block is R in the alm "
+          f"basis, L>=2 is leakage")
+    # Column blocks are 21 characters wide, built the same way in every line
+    # so the axis labels, the Re/Im pairs and the per-L summary all line up.
+    axline = " " * 6 + "".join(f"  {a:^19s}" for a in "xyz")
+    colline = ("     M" + "".join(f"  {'Re':>9s} {'Im':>9s}" for _ in range(3))
+               + "    MC err")
+    for l in range(1, L_OUT + 1):
+        print(f"\n   L = {l}")
+        print(axline)
+        print(colline)
+        for k in range(_NPACK):
+            if _PACK_L[k] != l:
+                continue
+            cells = "".join(f"  {R[k, j].real:+9.5f} {R[k, j].imag:+9.5f}"
+                            for j in range(3))
+            e = max(er[k].max(), ei[k].max())
+            print(f"     {_PACK_M[k]:d}{cells}   {e:.1e}")
+        # sqrt(C_L) of each column: the rms response this L carries per unit
+        # boost, and the same quantity the figure draws as bars.  A value at
+        # the floor is consistent with this L carrying no response at all.
+        rms = [np.sqrt(max(cl_from_power(np.abs(R[:, j]) ** 2)[l], 0.0))
+               for j in range(3)]
+        flo = [np.sqrt(max(cl_from_power(er[:, j] ** 2 + ei[:, j] ** 2)[l],
+                           0.0)) for j in range(3)]
+        print("   rms" + "".join(f"  {r:^19.3e}" for r in rms))
+        print(" floor" + "".join(f"  {f:^19.3e}" for f in flo))
+    print(f"\n   reconstruction noise N_L for reference:  "
+          + "  ".join(f"L={l}: {noise[l]:.2e}" for l in range(1, L_OUT + 1)))
+
+
 def report_leakage(leak, noise, mfcl, c1_recon):
-    """Print the leakage table for one case."""
+    """The leakage that follows from the response, contracted with the truth."""
     cl = leak["cl"]
     err = leak["err"]
     print(f"\nleakage of the L=1 boost into higher L, from {leak['n']} paired "
@@ -1110,30 +1293,34 @@ def report_leakage(leak, noise, mfcl, c1_recon):
     print(f"     L      C_L^leak      /C_1^rec     MC err      N_L^recon"
           f"     leak/N_L")
     for l in range(1, L_OUT + 1):
-        if l > 8 and l % 5 != 0:
-            continue
         print(f"   {l:3d}   {cl[l]:+.4e}    {cl[l] / c1_recon:9.5f}   "
               f"{err[l]:.2e}   {noise[l]:.3e}   {cl[l] / noise[l]:9.2e}")
     tail = np.clip(cl[2:], 0.0, None)
     ratio = (tail * (2 * _ELLS[2:] + 1)).sum() / (c1_recon * 3.0)
     print(f"   total power at L>=2, relative to the recovered L=1 dipole: "
           f"{ratio:.4f}")
-    print(f"   mean field power at L=2 is {mfcl[2] / cl[2]:.1f}x the leakage "
-          f"there, which is why this is measured from the paired\n"
-          f"   differences and not from the aberrated sims")
+    if cl[2] != 0:
+        print(f"   mean field power at L=2 is {mfcl[2] / cl[2]:.1f}x the "
+              f"leakage there, which is why this is measured from the paired\n"
+              f"   differences and not from the aberrated sims")
 
 
 def analyse(case, mf_vecs, diffs, data_vecs):
     print(f"\n{'=' * 72}\n {case}\n{'=' * 72}")
 
-    R, dR = response_matrix(diffs, case)
+    S = response_alm(diffs, case)
+    ar = alm_response(S)
+    R, Rsd, dR = response_matrix(S)
     Rinv = np.linalg.inv(R)
     scale = np.max(np.abs(R))
-    print(f"response matrix R, from {len(diffs[0])} paired sims per axis")
-    for row in R:
-        print("     " + "   ".join(f"{x:+9.5f}" for x in row))
+    print(f"response matrix R, from {ar['n']} paired sims per axis")
+    for i in range(3):
+        print("     " + "   ".join(f"{R[i, j]:+9.5f} +- {dR[i, j]:7.5f}"
+                                   for j in range(3)))
     print(f"   Monte Carlo error   {np.max(dR) / scale * 100:.3f}% of the "
           f"largest element")
+    print(f"   per-sim scatter     {np.max(Rsd) / scale * 100:.1f}% of it "
+          f"(sd, not the error on the mean)")
     print(f"   |R - I|_max         {np.max(np.abs(R - np.eye(3))):.4f}")
     print(f"   condition number    {np.linalg.cond(R):.2f}")
 
@@ -1184,8 +1371,10 @@ def analyse(case, mf_vecs, diffs, data_vecs):
           f"{np.linalg.norm(mf) / np.linalg.norm(R @ A_TRUE):.2f}")
     print(f"\namplitude, from {n_dat} aberrated sims and a "
           f"{n_mf}-sim mean field")
-    print(f"   mean A               = {amps.mean():+.4f} +- {err_mean:.4f}"
-          f"    (expect 1)")
+    print(f"   mean A               = {amps.mean():+.4f} +- {sigma:.4f} "
+          f"(sd)    (expect 1)")
+    print(f"                          {amps.mean():+.4f} +- {err_mean:.4f} "
+          f"(error on the mean, mean field included)")
     print(f"   scatter sigma(A)     = {sigma:.4f}"
           f"       (full-sky forecast {sigma_pred:.4f})")
     print(f"   before R correction  = {naive.mean():+.4f}")
@@ -1198,8 +1387,9 @@ def analyse(case, mf_vecs, diffs, data_vecs):
         nm = "xyz"[k]
         m = vel[:, k].mean()
         sem = vel[:, k].std(ddof=1) / np.sqrt(n_dat)
-        print(f"   v{nm}   = {m:+9.2f} +- {sem:6.2f}   "
-              f"scatter {vel[:, k].std(ddof=1):8.2f}   "
+        sd = vel[:, k].std(ddof=1)
+        print(f"   v{nm}   = {m:+9.2f} +- {sd:8.2f} (sd)   "
+              f"+- {sem:6.2f} (on the mean)   "
               f"residual {m - V_TRUE_KMS[k]:+7.2f} "
               f"({(m - V_TRUE_KMS[k]) / sem:+.1f} sigma)")
 
@@ -1211,10 +1401,11 @@ def analyse(case, mf_vecs, diffs, data_vecs):
     print(f"   per-sim error        = median {np.median(ang):5.1f} deg, "
           f"best {ang.min():.1f}, worst {ang.max():.1f}")
 
-    # Higher L.
-    leak = leakage_from_response(diffs, case)
+    # Higher L: the alm response itself, then the leakage it implies.
+    leak = leakage_from_alm(S)
     noise, mfcl, datleak = spectra_from_sims(mf_vecs, data_vecs, case)
     c1_recon = cl_from_power(np.abs(l1_to_alm(R @ A_TRUE)) ** 2)[1]
+    report_alm_response(ar, noise)
     report_leakage(leak, noise, mfcl, c1_recon)
     print(f"   cross-check from the aberrated sims: C_2 = "
           f"{datleak[2]:+.3e} against {leak['cl'][2]:+.3e} from the response")
@@ -1226,13 +1417,17 @@ def analyse(case, mf_vecs, diffs, data_vecs):
                      for v in mf_all[h:]])
     null_err = null.std(ddof=1) * np.sqrt(1.0 / len(null) + 1.0 / h)
     print(f"\nnull test, split-half mean field on the unaberrated sims")
-    print(f"   mean A               = {null.mean():+.4f} +- {null_err:.4f}"
-          f"    (expect 0)")
+    print(f"   mean A               = {null.mean():+.4f} +- "
+          f"{null.std(ddof=1):.4f} (sd)    (expect 0)")
+    print(f"                          {null.mean():+.4f} +- {null_err:.4f} "
+          f"(error on the mean)")
 
     return dict(sigma=sigma, amp=amps, naive=naive, dir=dirs, vel=vel,
-                velraw=velraw, R=R, leak=leak["cl"], leakerr=leak["err"],
+                velraw=velraw, R=R, Rsd=Rsd, Rerr=dR,
+                Ralm=ar["R"], Ralm_sd_re=ar["sd_re"], Ralm_sd_im=ar["sd_im"],
+                leak=leak["cl"], leakerr=leak["err"],
                 noise=noise, mfcl=mfcl, datleak=datleak, n_dat=n_dat,
-                n_mf=n_mf)
+                n_mf=n_mf, n_resp=ar["n"])
 
 
 def sim_budget(results, n_resp):
@@ -1292,8 +1487,12 @@ def main():
               f"({w1 * 41253:.0f} deg^2)")
     if args.mask == "dr6":
         print(f"                 {os.path.basename(DR6_PATH)}")
-        print(f"                 variant {args.dr6_variant}, binned from "
-              f"nside {DR6_NSIDE}, digest {MASK_DIGEST}")
+        print(f"                 variant {args.dr6_variant}, nside "
+              f"{DR6_NSIDE} -> CAR by {args.dr6_method}"
+              + (f" order {args.dr6_order}" if args.dr6_method == "spline"
+                 else "")
+              + (f", rot {args.dr6_rot}" if args.dr6_rot else "")
+              + f", digest {MASK_DIGEST}")
         print(f"                 {w1 * 41253:.0f} deg^2, "
               f"sqrt(w4)/w2 {np.sqrt(w4) / w2:.3f}")
         print(f"                 healpix w1 {DR6_W_NATIVE[0]:.4f}, "
@@ -1350,7 +1549,7 @@ def main():
               f"{results[case]['sigma'] / base:6.3f}"
               f"   (analytic forecast {1.0 / pred:6.3f})")
 
-    sim_budget(results, len(diffs[0]))
+    sim_budget(results, results[list(results)[-1]]["n_resp"])
     write_summary(results)
 
 
@@ -1378,11 +1577,16 @@ def write_summary(results):
                w_native=w_native,
                mask_at_dipole=float(mask_at(BDIR[0], BDIR[1])),
                res_arcmin=float(RES / utils.arcmin),
+               pack_l=_PACK_L, pack_m=_PACK_M,
+               n_resp_used=int(results[cases[0]]["n_resp"]),
+               mask_method=np.array(args.dr6_method if args.mask == "dr6"
+                                    else ""),
                mask_thumb=thumb, mask_thumb_dec=thumb_dec,
                mask_thumb_ra=thumb_ra,
                dipole_radec=np.degrees(np.asarray(BDIR, dtype=float)))
 
     per_case_keys = ["vel", "velraw", "amp", "naive", "dir", "R",
+                     "Rsd", "Rerr", "Ralm", "Ralm_sd_re", "Ralm_sd_im",
                      "leak", "leakerr", "noise", "mfcl", "datleak"]
     for k in range(len(cases)):
         r = results[cases[k]]
