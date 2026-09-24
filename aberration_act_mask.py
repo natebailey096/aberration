@@ -12,6 +12,34 @@ a footprint and drives an all-positive mask negative.  --dr6-method harm and
 --dr6-method average (the old area-average binning) are kept so the three can
 be compared on the same run; the printed w1, w2, w4 ratios are where to look.
 
+--noise-model act replaces the flat white noise with the one ACT actually
+sees through the atmosphere,
+
+    N_l = W (1 + (l/l_knee)^alpha) / B_l^2,
+    B_l^2 = exp(-l(l+1) sigma_b^2),   sigma_b = FWHM / sqrt(8 ln 2),
+
+with W, the beam and the knees taken from --act-band and overridable one at a
+time.  Only l = 0 is pinned; the low-l tail is left alone, because it is real
+and the mask couples it into the band the estimator uses.  alpha is negative, so the bracket grows towards low l: at l = l_knee it
+is 2 by definition, and at l = 0.1 l_knee it is about 1000, which is what the
+DR6 maps paper quotes.  The values come from ACT DR6 (arXiv:2503.14451 and
+2503.14452) and are listed with their sources at ACT_BANDS below.  This makes
+everything below a few hundred useless, so --lmin is exposed alongside it;
+DR6 lensing uses 600 to 3000.  The default, white, is untouched and keys to
+the same cache as before.
+
+--cmb chooses what the sims are drawn from.  The default, unlensed, is the
+original behaviour and keys to the same cache directory as before, so existing
+runs stay valid and are reused.  --cmb lensed draws phi alongside the unlensed
+CMB from one seed and deflects each realisation, so the maps carry a real
+lensing signal that the quadratic estimator responds to; one seed for both
+fields is what keeps the response pairs valid, since the two legs share the
+map and therefore the phi, and lensing cancels in their difference the way the
+mean field does.  --cmb lensed_cl is the cheap stand-in, Gaussian maps drawn
+from the lensed power spectra: it has the extra power and the smoothing but no
+lensing signal, so it will not show a lensing contribution to the
+reconstruction.  Each mode writes to its own cache directory.
+
 The response is measured with boosts along x, y and z, and reported two ways
 from exactly the same paired sims:
 
@@ -92,10 +120,45 @@ parser = argparse.ArgumentParser(
     description="CMB aberration reconstruction with a lensing quadratic estimator")
 parser.add_argument("--quick", action="store_true")
 parser.add_argument("--seed-offset", type=int, default=0)
-parser.add_argument("--noise", type=float, default=10.0,
+parser.add_argument("--noise-model", default="white",
+                    choices=["white", "act"],
+                    help="white is the default and leaves every existing "
+                         "cache valid.  act adds the atmospheric 1/f knee "
+                         "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
+                         "/ B_l^2")
+parser.add_argument("--act-band", default="coadd",
+                    choices=["f090", "f150", "f220", "coadd"],
+                    help="which ACT array-band the --noise-model act defaults "
+                         "come from; --noise, --beam, --ell-knee and --alpha "
+                         "override any of them individually")
+parser.add_argument("--ell-knee", type=float, default=None,
+                    help="temperature knee; the multipole where atmospheric "
+                         "and white noise are equal")
+parser.add_argument("--alpha", type=float, default=None,
+                    help="atmospheric slope, negative so that the term grows "
+                         "towards low l (ACT measures about -3)")
+parser.add_argument("--ell-knee-pol", type=float, default=None)
+parser.add_argument("--alpha-pol", type=float, default=None)
+parser.add_argument("--lmin", type=int, default=2,
+                    help="lowest CMB multipole the estimator uses.  2 is the "
+                         "default; ACT-like noise makes everything below a "
+                         "few hundred useless, and DR6 lensing uses 600")
+parser.add_argument("--noise", type=float, default=None,
                     help="white noise in T, uK-arcmin")
 parser.add_argument("--pol-noise-factor", type=float, default=np.sqrt(2.0))
-parser.add_argument("--beam", type=float, default=0.0, help="FWHM in arcmin")
+parser.add_argument("--beam", type=float, default=None,
+                    help="FWHM in arcmin")
+parser.add_argument("--cmb", default="unlensed",
+                    choices=["unlensed", "lensed", "lensed_cl"],
+                    help="what CMB the sims are drawn from.  unlensed is the "
+                         "default and leaves every existing cache valid.  "
+                         "lensed deflects each realisation by its own phi "
+                         "field, so the maps carry a real lensing signal and "
+                         "the quadratic estimator responds to it; it costs a "
+                         "full lensing operation per sim.  lensed_cl is the "
+                         "cheap stand-in: Gaussian maps drawn from the lensed "
+                         "power spectra, which get the extra power and the "
+                         "smoothing but no lensing signal at all")
 parser.add_argument("--lmax", type=int, default=3000)
 parser.add_argument("--res", type=float, default=3.0,
                     help="arcmin; pass 0 for the finest resolution "
@@ -151,7 +214,58 @@ parser.add_argument("--plot-dir", default=None)
 args = parser.parse_args()
 
 # multipoles
-LMIN = 2
+CMB_MODE = args.cmb
+# Only "lensed" needs pixell's lensing module, and only that mode pays for
+# importing it.
+if CMB_MODE == "lensed":
+    from pixell import lensing as plensing
+
+# ACT DR6 noise, from Naess et al. 2025 (arXiv:2503.14451, the DR6 maps paper)
+# and Louis et al. 2025 (arXiv:2503.14452, the DR6 power spectra paper).
+#   white   temperature RMS above l = 4000, uK-arcmin, over ~11,000 deg^2:
+#           20 (PA5 f090), 23 (PA6 f090), 24 (PA5 f150), 28 (PA6 f150),
+#           82 (PA4 f220).  The coadd entry is the ~10 uK-arcmin median depth
+#           quoted for the combined DR6 maps.
+#   fwhm    effective map beams, 2.07/1.42/1.01 arcmin at f090/f150/f220.
+#   knee_T  temperature knee, "mainly a function of bandpass, being around
+#           2100/3000/3800 at f090/f150/f220".
+#   knee_P  polarisation knee, which depends on array and declination:
+#           300 (PA5 f090), 450 (PA6 f090), 600 (PA4 f150), 500 (PA5 f150),
+#           450 (PA6 f150), 640 (PA4 f220).  The entries below are round
+#           numbers through those.
+# Polarisation white noise is sqrt(2) times temperature, which is what
+# --pol-noise-factor already defaults to.
+ACT_BANDS = {
+    "f090":  dict(white=20.0, fwhm=2.07, knee_T=2100.0, knee_P=350.0),
+    "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
+    "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
+    "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
+}
+# The atmosphere is a power law in both time and map domain with a slope of
+# about -3, in temperature and in polarisation alike.
+ACT_ALPHA = -3.0
+
+NOISE_MODEL = args.noise_model
+_band = ACT_BANDS[args.act_band]
+
+
+def _pick(given, act_default, white_default):
+    """Explicit flag first, then the band preset, then the old default."""
+    if given is not None:
+        return given
+    return act_default if NOISE_MODEL == "act" else white_default
+
+
+ELL_KNEE_T = _pick(args.ell_knee, _band["knee_T"], np.inf)
+ELL_KNEE_P = _pick(args.ell_knee_pol, _band["knee_P"], np.inf)
+ALPHA_T = _pick(args.alpha, ACT_ALPHA, 0.0)
+ALPHA_P = _pick(args.alpha_pol, ACT_ALPHA, 0.0)
+if NOISE_MODEL == "act" and (ALPHA_T > 0 or ALPHA_P > 0):
+    print("WARNING: alpha is positive, so (l/l_knee)^alpha grows towards "
+          "high l rather than low l.\n         ACT's atmosphere is about "
+          "-3; check the sign.", flush=True)
+
+LMIN = args.lmin
 LMAX = args.lmax
 MLMAX = LMAX + 500
 if args.res and args.res > 0:
@@ -160,9 +274,9 @@ else:
     RES = min(4.0, 10800.0 / (1.08 * MLMAX)) * utils.arcmin
 
 # noise information
-NOISE_UK_ARCMIN = args.noise
+NOISE_UK_ARCMIN = _pick(args.noise, _band["white"], 10.0)
 POL_NOISE_FACTOR = args.pol_noise_factor
-BEAM_FWHM_ARCMIN = args.beam
+BEAM_FWHM_ARCMIN = _pick(args.beam, _band["fwhm"], 0.0)
 TCMB_UK = 2.7255e6
 C_KMS = 299792.458
 
@@ -172,7 +286,9 @@ N_RESPONSE = args.n_response
 N_DATA = args.n_data
 
 if args.quick:
-    LMIN, LMAX, MLMAX = 2, 1000, 1200
+    # LMIN is left alone: it was already 2 here, which is its default, so this
+    # behaves as before unless --lmin was asked for explicitly.
+    LMAX, MLMAX = 1000, 1200
     RES = 8.0 * utils.arcmin
     N_MEANFIELD, N_RESPONSE, N_DATA = 12, 4, 12
 
@@ -352,29 +468,84 @@ pars = camb.set_params(H0=67.5, ombh2=0.022, omch2=0.122,
 # the leakage plot; it does not feed the sims.
 pars.set_for_lmax(MLMAX + 500, lens_potential_accuracy=1)
 
-# Note: unlensed right now, something to check in future
 camb_results = camb.get_results(pars)
-camb_cls = camb_results.get_cmb_power_spectra(
-    pars, raw_cl=True, spectra=["unlensed_scalar"])["unlensed_scalar"]
+_want = ["unlensed_scalar"]
+if CMB_MODE != "unlensed":
+    _want.append("lensed_scalar")
+_cls = camb_results.get_cmb_power_spectra(pars, raw_cl=True, spectra=_want)
 
-cltt = camb_cls[:MLMAX + 1, 0].copy()
-clee = camb_cls[:MLMAX + 1, 1].copy()
-clbb = camb_cls[:MLMAX + 1, 2].copy()    # BB is not used
-clte = camb_cls[:MLMAX + 1, 3].copy()
 
-# Real lensing power at the same low L, purely as a yardstick for the leakage.
-_pp = camb_results.get_lens_potential_cls(lmax=max(L_OUT, 10))[:, 0]
-_l = _ELLS[1:].astype(float)
-CLPP = np.zeros(L_OUT + 1)
-CLPP[1:] = 2.0 * np.pi * _pp[1:L_OUT + 1] / (_l * (_l + 1.0)) ** 2
+def _camb_take(name):
+    """TT, EE, BB, TE out to MLMAX from one CAMB block."""
+    a = _cls[name]
+    if a.shape[0] < MLMAX + 1:
+        raise SystemExit(
+            f"CAMB returned {name} only to l = {a.shape[0] - 1}, below mlmax "
+            f"{MLMAX}.  Raise the lmax passed to set_for_lmax.")
+    return [a[:MLMAX + 1, k].copy() for k in range(4)]
+
+
+# Unlensed is always needed: it is the default observed spectrum, and it is
+# also the field that gets deflected when --cmb lensed does the lensing.
+untt, unee, unbb, unte = _camb_take("unlensed_scalar")
+if CMB_MODE == "unlensed":
+    cltt, clee, clbb, clte = untt, unee, unbb, unte
+else:
+    # Weights and filters follow what the sky actually looks like, which once
+    # the maps are lensed is the lensed spectrum, in both lensed modes.
+    cltt, clee, clbb, clte = _camb_take("lensed_scalar")
+
+# Real lensing power.  The low-L slice is the yardstick for the leakage plot;
+# the full array is the phi field --cmb lensed deflects by.
+_ppc = camb_results.get_lens_potential_cls(lmax=MLMAX)
+_lf = np.arange(MLMAX + 1, dtype=float)
+_ff = _lf * (_lf + 1.0)
+CLPP_FULL = np.zeros(MLMAX + 1)
+CLPP_FULL[1:] = 2.0 * np.pi * _ppc[1:MLMAX + 1, 0] / _ff[1:] ** 2
+CLPP = CLPP_FULL[:L_OUT + 1].copy()
 
 # Noise, converted from uK-arcmin into the same dimensionless units.
+#
+#     N_l = W (1 + (l/l_knee)^alpha) / B_l^2
+#
+# W is the white level, the bracket is the atmospheric 1/f the telescope looks
+# through, and B_l^2 = exp(-l(l+1) sigma_b^2) with sigma_b = FWHM / sqrt(8 ln2)
+# deconvolves the beam.  With --noise-model white the bracket is 1 and this is
+# the plain W / B_l^2 it has always been.
 noise_rms = NOISE_UK_ARCMIN * utils.arcmin / TCMB_UK
 nltt = np.full(MLMAX + 1, noise_rms ** 2)
 nlee = POL_NOISE_FACTOR ** 2 * nltt
 nlbb = nlee.copy()
 
+
+def atmosphere(ell_knee, alpha):
+    """1 + (l/l_knee)^alpha, with l = 0 held at its l = 1 value.
+
+    A negative alpha diverges as l -> 0, so l = 0 has to be pinned, but
+    nothing below LMIN is capped: at ACT's knees that tail is a few hundred uK
+    of large-scale noise, which is real, is what the atmosphere does, and
+    couples through the mask into the band the estimator does use.  Flattening
+    it would quietly delete that.  Note this is only true for a slope as shallow
+    as ACT's -3; a much steeper alpha would need a cap of its own.
+    """
+    f = np.ones(MLMAX + 1)
+    if not np.isfinite(ell_knee) or alpha == 0.0:
+        return f
+    ell = np.arange(MLMAX + 1, dtype=float)
+    f[1:] = 1.0 + (ell[1:] / ell_knee) ** alpha
+    f[0] = f[1]
+    return f
+
+
+ATMOS_T = atmosphere(ELL_KNEE_T, ALPHA_T)
+ATMOS_P = atmosphere(ELL_KNEE_P, ALPHA_P)
+nltt = nltt * ATMOS_T
+nlee = nlee * ATMOS_P
+nlbb = nlbb * ATMOS_P
+
 if BEAM_FWHM_ARCMIN > 0:
+    # hp.gauss_beam returns exp(-l(l+1) sigma_b^2 / 2), so bl**2 is the
+    # B_l^2 above with sigma_b^2 = FWHM^2 / (8 ln 2).
     bl = hp.gauss_beam(BEAM_FWHM_ARCMIN * utils.arcmin, lmax=MLMAX)
     nltt = nltt / bl ** 2
     nlee = nlee / bl ** 2
@@ -391,12 +562,47 @@ tcls = {"TT": cltt + nltt, "EE": clee + nlee,                    # filters
         "BB": clbb + nlbb, "TE": clte}
 
 # Signal and noise covariances in the T, E, B basis, for generating the sims.
+# Under --cmb lensed the maps are drawn unlensed and then deflected, so this is
+# the unlensed spectrum there and the observed one otherwise.  Getting this
+# wrong would lens an already-lensed sky and double-count the smoothing.
+if CMB_MODE == "lensed":
+    sitt, siee, sibb, site = untt, unee, unbb, unte
+else:
+    sitt, siee, sibb, site = cltt, clee, clbb, clte
+
 signal_ps = np.zeros((3, 3, MLMAX + 1))
-signal_ps[0, 0] = cltt
-signal_ps[1, 1] = clee
-signal_ps[2, 2] = clbb
-signal_ps[0, 1] = clte
-signal_ps[1, 0] = clte
+signal_ps[0, 0] = sitt
+signal_ps[1, 1] = siee
+signal_ps[2, 2] = sibb
+signal_ps[0, 1] = site
+signal_ps[1, 0] = site
+
+# The [phi, T, E, B] covariance the lensed sims are drawn from.  The phi-T and
+# phi-E cross spectra are the ISW correlation; they are real and lmin is 2
+# here, so they are kept rather than quietly dropped.  CAMB returns them as
+# [L(L+1)]^{3/2} C_L / 2pi, hence the 1.5 power.
+if CMB_MODE == "lensed":
+    _clpt = np.zeros(MLMAX + 1)
+    _clpe = np.zeros(MLMAX + 1)
+    _clpt[1:] = 2.0 * np.pi * _ppc[1:MLMAX + 1, 1] / _ff[1:] ** 1.5
+    _clpe[1:] = 2.0 * np.pi * _ppc[1:MLMAX + 1, 2] / _ff[1:] ** 1.5
+
+    _M = np.zeros((MLMAX + 1, 4, 4))
+    _M[:, 0, 0] = CLPP_FULL
+    _M[:, 1:, 1:] = np.moveaxis(signal_ps, -1, 0)
+    _M[:, 0, 1] = _M[:, 1, 0] = _clpt
+    _M[:, 0, 2] = _M[:, 2, 0] = _clpe
+    # Drawing a Gaussian field needs a positive semi-definite covariance at
+    # every L.  If the cross terms push it negative anywhere, drop them and
+    # say so rather than handing curvedsky a matrix it cannot factor.
+    _ev = np.linalg.eigvalsh(_M[2:])
+    if np.any(_ev.min(axis=-1) < -1e-8 * np.maximum(_ev.max(axis=-1), 1e-300)):
+        print("WARNING: phi-T/phi-E cross spectra make the input covariance "
+              "indefinite; dropping them.", flush=True)
+        _M[:, 0, 1] = _M[:, 1, 0] = 0.0
+        _M[:, 0, 2] = _M[:, 2, 0] = 0.0
+    PS_LENSINPUT = np.ascontiguousarray(np.moveaxis(_M, 0, -1))
+    del _M
 
 noise_ps = np.zeros((3, 3, MLMAX + 1))
 noise_ps[0, 0] = nltt
@@ -761,6 +967,14 @@ _config = ("v2", L_OUT, LMIN, LMAX, MLMAX, round(RES, 12), NOISE_UK_ARCMIN,
            tuple(round(float(x), 12) for x in np.asarray(BDIR).ravel()))
 if args.seed_offset:
     _config = _config + ("seed", args.seed_offset)
+# Appended only when it is not the default, so every cache written before this
+# option existed still keys to the same directory and stays valid.
+if CMB_MODE != "unlensed":
+    _config = _config + ("cmb", CMB_MODE)
+if NOISE_MODEL != "white":
+    _config = _config + ("noise", NOISE_MODEL, "v2",
+                         round(float(ELL_KNEE_T), 6), round(float(ALPHA_T), 6),
+                         round(float(ELL_KNEE_P), 6), round(float(ALPHA_P), 6))
 
 # MASK_KEY names the analytic masks completely, but the dr6 mask comes out of a
 # file, so hash the mask itself: a re-downloaded or edited file, or a different
@@ -771,9 +985,11 @@ if args.mask == "dr6":
     _config = _config + ("dr6", MASK_DIGEST)
 
 _seed_tag = f"_seed{args.seed_offset}" if args.seed_offset else ""
+_cmb_tag = "" if CMB_MODE == "unlensed" else f"_{CMB_MODE}"
+_noise_tag = "" if NOISE_MODEL == "white" else f"_act{args.act_band}"
 CACHE_DIR = os.path.join(
     args.cache,
-    f"{MASK_KEY}_lmax{LMAX}{_seed_tag}_"
+    f"{MASK_KEY}_lmax{LMAX}{_noise_tag}{_cmb_tag}{_seed_tag}_"
     + hashlib.md5(repr(_config).encode()).hexdigest()[:8])
 os.makedirs(CACHE_DIR, exist_ok=True)
 PLOT_DIR = args.plot_dir or os.path.join(CACHE_DIR, "plots")
@@ -791,9 +1007,26 @@ def seeds(stage, i):
 
 
 def cmb_map(seed):
-    """Unaberrated T, Q, U realisation of the theory spectra."""
-    return curvedsky.rand_map((3,) + shape, wcs, signal_ps, lmax=MLMAX,
-                              seed=seed)
+    """Unaberrated T, Q, U realisation of the theory spectra.
+
+    Under --cmb lensed this draws phi together with the unlensed CMB from one
+    seed and returns the deflected map, so the sky carries a real lensing
+    signal and the quadratic estimator responds to it as it would on data.
+    One seed for both fields is what keeps a response pair valid: the two legs
+    of a pair share this map, so they share its phi, and the lensing cancels
+    in their difference exactly as the mean field does.
+
+    The other two modes are plain Gaussian draws, from the unlensed spectra by
+    default and from the lensed ones under --cmb lensed_cl.
+    """
+    if CMB_MODE != "lensed":
+        return curvedsky.rand_map((3,) + shape, wcs, signal_ps, lmax=MLMAX,
+                                  seed=seed)
+    out = plensing.rand_map((3,) + shape, wcs, PS_LENSINPUT, lmax=MLMAX,
+                            seed=seed, output="l")
+    # rand_map returns one entry per character of output, as a tuple, even
+    # when only the lensed map was asked for.
+    return out[0] if isinstance(out, (tuple, list)) else out
 
 
 def noise_map(seed):
@@ -1517,6 +1750,27 @@ def main():
         print(f"                 one TQU map is {gb:.2f} GB, and a worker "
               f"needs several at once")
     print(f"estimators     = {', '.join(ESTIMATORS)}")
+    _cmb_says = {"unlensed": "unlensed Gaussian sims",
+                 "lensed_cl": "Gaussian sims from lensed spectra "
+                              "(no lensing signal in the maps)",
+                 "lensed": "each sim lensed by its own phi field"}[CMB_MODE]
+    print(f"CMB            = {CMB_MODE}  ({_cmb_says})")
+    print(f"noise          = {NOISE_MODEL}, {NOISE_UK_ARCMIN:g} uK-arcmin "
+          f"white, beam {BEAM_FWHM_ARCMIN:g} arcmin")
+    if NOISE_MODEL == "act":
+        print(f"                 band {args.act_band}, l_knee "
+              f"{ELL_KNEE_T:g} (T) / {ELL_KNEE_P:g} (P), alpha "
+              f"{ALPHA_T:g} (T) / {ALPHA_P:g} (P)")
+        # What the atmosphere actually costs, where the estimator works.
+        for l in (LMIN, 500, 1000, 2000):
+            if l <= LMAX:
+                print(f"                 l={l:5d}:  N_l^TT is "
+                      f"{ATMOS_T[l]:9.4g}x white, N_l^EE {ATMOS_P[l]:9.4g}x")
+    if CMB_MODE == "lensed":
+        print(f"                 {N_MEANFIELD + N_DATA + N_RESPONSE} lensing "
+              f"operations, one per realisation; this dominates the run time, "
+              f"and\n                 lensing holds several extra full-sky "
+              f"maps, so raise memory per worker before --nproc")
     print(f"{'=' * 72}")
 
     mf_vecs = run_meanfield()
@@ -1581,6 +1835,19 @@ def write_summary(results):
                n_resp_used=int(results[cases[0]]["n_resp"]),
                mask_method=np.array(args.dr6_method if args.mask == "dr6"
                                     else ""),
+               cmb_mode=np.array(CMB_MODE),
+               noise_model=np.array(NOISE_MODEL),
+               # The filter noise and the theory signal, so the noise model
+               # can be looked at rather than taken on trust.  Dimensionless,
+               # like everything else here; tcmb_uk converts to uK^2.
+               nl_tt=nltt, nl_ee=nlee, cl_tt=cltt, cl_ee=clee,
+               tcmb_uk=float(TCMB_UK),
+               pol_noise_factor=float(POL_NOISE_FACTOR),
+               noise_uk_arcmin=float(NOISE_UK_ARCMIN),
+               beam_fwhm_arcmin=float(BEAM_FWHM_ARCMIN),
+               ell_knee=np.array([ELL_KNEE_T, ELL_KNEE_P]),
+               alpha_atm=np.array([ALPHA_T, ALPHA_P]),
+               lmin=int(LMIN),
                mask_thumb=thumb, mask_thumb_dec=thumb_dec,
                mask_thumb_ra=thumb_ra,
                dipole_radec=np.degrees(np.asarray(BDIR, dtype=float)))
