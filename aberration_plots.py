@@ -1035,7 +1035,8 @@ def _plot_noise(S, path, field):
     ax.set_xlim(0, hi)
     d_cl = (dfac * cl * t2)[sl]
     d_nl = (dfac * nl * t2)[sl]
-    ax.set_ylim(d_cl.max() * 1e-4, max(d_cl.max(), d_nl.max()) * 3.0)
+    #ax.set_ylim(d_cl.max() * 1e-4, max(d_cl.max(), d_nl.max()) * 3.0)
+    ax.set_ylim(d_cl.max() * 1e-3, max(d_cl.max(), d_nl.max()) * 0.3)
     ax.set_xlabel(r"multipole $\ell$")
     ax.set_ylabel(r"$\ell(\ell+1)C_\ell/2\pi$  [$\mu$K$^2$]")
     ax.legend(fontsize=9.5, loc="upper right", frameon=True, framealpha=0.95,
