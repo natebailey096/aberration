@@ -25,8 +25,6 @@ Figures
                       the R^-1 correction
   velocity_planes     the same sims in the xy, xz, yz planes with covariance
                       ellipses: the error shape R^-1 leaves behind
-  response_sky        d.Rd, the misalignment of Rd, and sigma_v, as a function
-                      of where on the sky the boost points
   response_matrix     R, R^-1 and the eigenvalues of the symmetric part
   amplitude_direction the R^-1 corrected amplitude and the recovered
                       directions; the uncorrected estimator is stored but
@@ -37,6 +35,9 @@ Figures
                       boxed L=1 block is the response matrix itself; the rest
                       is leakage.  Reported as the coefficients themselves
                       rather than collapsed into a power spectrum
+  noise_spectra_tt    the theory signal and the CMB noise the filters were
+  noise_spectra_ee    built from, both as D_l, temperature and polarisation
+                      on separate figures, always out to NOISE_PLOT_LMAX
   leakage_spectrum    coherent power the boost leaves at each L out to
                       LEAK_LMAX, measured from the aberrated data sims
                       (mean field subtracted), with 1 and 2 sd bars
@@ -135,6 +136,10 @@ FOOTPRINT_LEVEL = 0.5
 # Highest L drawn on the higher-L figures.  The pipeline reconstructs out to
 # --lout, 5 by default, and the alm response is reported over all of it.
 LEAK_LMAX = 5
+
+# Highest multipole the noise figures draw.  Fixed rather than taken from
+# lmax, so that runs with different lmax are drawn on the same axis.
+NOISE_PLOT_LMAX = 3000
 
 # Equatorial -> galactic rotation, built from the three angles that define the
 # frame rather than typed in as nine numbers: the north galactic pole, and the
@@ -397,32 +402,6 @@ def _dress_sky(ax, lon0=0.0, label_size=8, ra_labels=True):
             lab.set_bbox(dict(fc="white", ec="none", alpha=0.7, pad=1.0))
     ax.set_yticks(np.radians([-60, -30, 0, 30, 60]))
     ax.tick_params(labelsize=label_size)
-
-
-def _mask_outline(ax, S, lon0=0.0, coarsen_deg=2.0, **kw):
-    """Outline of the footprint, as a thin dark line at half weight.
-
-    The mask is block-averaged to `coarsen_deg` first.  Contouring the full
-    thumbnail instead would draw a ring around each of the hundreds of
-    point-source holes, which buries the boundary that the outline is for.
-    """
-    mesh = _mask_mesh(S, lon0)
-    if mesh is None:
-        return False
-    X, Y, W = mesh
-    f = max(1, int(round(coarsen_deg * (W.shape[0] - 1) / 180.0)))
-    if f > 1:
-        ny, nx = (W.shape[0] // f) * f, (W.shape[1] // f) * f
-        if ny >= 2 * f and nx >= 2 * f:
-            W = W[:ny, :nx].reshape(ny // f, f, nx // f, f).mean(axis=(1, 3))
-            X = X[:ny, :nx].reshape(ny // f, f, nx // f, f).mean(axis=(1, 3))
-            Y = Y[:ny, :nx].reshape(ny // f, f, nx // f, f).mean(axis=(1, 3))
-    if not (W.min() < 0.5 < W.max()):
-        return False
-    opts = dict(levels=[0.5], colors=[INK], linewidths=0.9, alpha=0.8)
-    opts.update(kw)
-    ax.contour(X, Y, W, **opts)
-    return True
 
 
 def _mark_dipole(ax, S, lon0=0.0, ms=16, antipode=True, frame="equ"):
@@ -734,52 +713,6 @@ def plot_planes(S, path):
     return path
 
 
-def plot_response_sky(S, path):
-    """What the response does as a function of where the boost points.
-
-    All three panels are properties of the measured R (and, for sigma_v, of
-    the measured covariance), evaluated for a unit boost along every direction
-    on the sky.  The footprint outline and the input dipole are marked.
-    """
-    _style()
-    R = np.asarray(S["R"], float)
-    lon0 = _lon0(S)
-    X, Y, d = _sky_mesh(lon0)
-    Rd = d @ R.T                                   # reconstructed direction
-    amp = np.einsum("...i,...i->...", d, Rd)       # d . R d
-    mis = np.degrees(np.arccos(np.clip(
-        np.einsum("...i,...i->...", Rd, d)
-        / np.linalg.norm(Rd, axis=-1), -1, 1)))
-    cov = np.cov(np.asarray(S["vel"], float).T)
-    sig = np.sqrt(np.einsum("...i,ij,...j->...", d, cov, d))
-
-    panels = [(amp, r"$\hat{d}\cdot R\,\hat{d}$", "viridis",
-               "signal recovered before $R^{-1}$"),
-              (mis, "misalignment of $R\\,\\hat{d}$  [deg]", "magma",
-               "rotation of the reconstructed direction"),
-              (sig, r"$\sigma_v$ along $\hat{d}$  [km s$^{-1}$]", "cividis",
-               "per-sim error for a boost that way")]
-
-    fig = plt.figure(figsize=(13.2, 4.6))
-    for n, (Z, title, cmap, sub) in enumerate(panels):
-        ax = fig.add_subplot(1, 3, n + 1, projection="mollweide")
-        im = ax.pcolormesh(X, Y, Z, shading="auto", cmap=cmap,
-                           rasterized=True, zorder=0)
-        # White underneath, dark on top, so the outline reads on any colormap.
-        _mask_outline(ax, S, lon0, colors=["white"], linewidths=1.6,
-                      alpha=0.9)
-        _mask_outline(ax, S, lon0, linewidths=0.7)
-        _mark_dipole(ax, S, lon0, ms=14, antipode=False)
-        _dress_sky(ax, lon0, label_size=7, ra_labels=False)
-        ax.set_title(title, fontsize=11, pad=12)
-        cb = fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.05,
-                          fraction=0.05, aspect=28)
-        cb.ax.tick_params(labelsize=8.5)
-    fig.savefig(path)
-    plt.close(fig)
-    return path
-
-
 def plot_response_matrix(S, path):
     """R, its inverse, and the eigen-structure of its symmetric part."""
     _style()
@@ -828,6 +761,13 @@ def plot_response_matrix(S, path):
     return path
 
 
+def _sim_counts(S, n_amp):
+    """The three sim counts behind an estimate, as one short line."""
+    n_mf = int(_scalar(S, "n_mf", 0))
+    n_rs = int(_scalar(S, "n_resp_used", 0)) or int(_scalar(S, "n_resp", 0))
+    return (f"$N$: {n_amp} data, {n_mf} mean field, {n_rs} response")
+
+
 def plot_amplitude(S, path):
     """Corrected amplitude and the recovered directions.
 
@@ -855,7 +795,7 @@ def plot_amplitude(S, path):
     sd = amp.std(ddof=1)
     ax0.hist(amp, bins=bins, histtype="step", lw=1.8, color=COR,
              label=f"$R^{{-1}}$ corrected:  {amp.mean():+.3f} $\\pm$ "
-                   f"{sd:.3f}\n$N = {len(amp)}$ sims")
+                   f"{sd:.3f}\n{_sim_counts(S, len(amp))}")
     # Mean, and the +-1 and +-2 sd bands the whisker figure also draws.
     ax0.axvspan(amp.mean() - sd, amp.mean() + sd, color=COR, alpha=0.10,
                 lw=0, zorder=0)
@@ -900,7 +840,26 @@ def plot_amplitude(S, path):
         ax1.text(0.0, r, f"{r}$^\\circ$", fontsize=8.5, color="0.4",
                  ha="center", va="center", zorder=5,
                  bbox=dict(fc="white", ec="none", pad=1.2))
+    # The scatter's own 1 and 2 sd contours, so the spread on the direction is
+    # drawn and not only quoted: the same 1 and 2 sd the amplitude panel marks
+    # and the velocity boxes span.
+    off = np.column_stack([sep * np.sin(psi), sep * np.cos(psi)])
+    if off.shape[0] > 2:
+        cov = np.cov(off, rowvar=False)
+        for k in (1, 2):
+            _ellipse(ax1, off.mean(axis=0), cov, k, fill=False,
+                     edgecolor=COR, lw=1.3, ls=(0, (5, 3)), zorder=4)
     ax1.plot(0, 0, "*", ms=18, color=TRUTH, zorder=6)
+    # The same mean +- sd the amplitude panel quotes, for the angle off the
+    # input axis.  The rings give the scale; this gives the number.
+    ax1.legend(handles=[Line2D([], [], marker="o", ls="none", color=COR,
+                               alpha=0.7, ms=5,
+                               label=f"offset  {sep.mean():.1f}$^\\circ$ "
+                                     f"$\\pm$ {sep.std(ddof=1):.1f}$^\\circ$"),
+                        Line2D([], [], color=COR, lw=1.3, ls=(0, (5, 3)),
+                               label="1, 2 sd")],
+               fontsize=9.5, loc="upper right", frameon=True,
+               framealpha=0.95, edgecolor="0.8")
     lim = 1.15 * max(rmax, 1e-3)
     ax1.set_xlim(-lim, lim)
     ax1.set_ylim(-lim, lim)
@@ -920,41 +879,47 @@ def _fmt_cell(v):
     return f"{v:+.3f}" if abs(v) >= 5e-3 else f"{v:+.0e}".replace("e-0", "e-")
 
 
-def _real_basis(R, sd_re, sd_im, pl, pm, lmax):
-    """Complex a_LM (M >= 0) -> real spherical-harmonic coefficients.
+def _real_rows(pl, pm, lmax):
+    """The (L, M) rows, M from -L to L, present in a packed alm array."""
+    return [(l, m) for l in range(1, lmax + 1) for m in range(-l, l + 1)
+            if np.any((pl == l) & (pm == abs(m)))]
 
-    For a real field every complex a_LM with M > 0 carries two real numbers,
-    and the real harmonics hold them as two signed coefficients:
 
-        r_L0 = a_L0,   r_LM = sqrt2 (-1)^M Re a_LM,   r_L,-M = -sqrt2 (-1)^M Im a_LM.
+def _to_real(A, pl, pm, lmax):
+    """Packed complex alm (M >= 0) -> real spherical-harmonic coefficients.
 
-    That is a rotation of the same information, not a summary of it, so one
-    signed number per mode replaces a real part and an imaginary part, and
-    sum_M r_LM^2 is the same power the complex coefficients carry.  It is also
-    the basis in which L = 1 is Cartesian: sqrt(3/4pi) (r_1,+1, r_1,-1, r_1,0)
-    is (x, y, z), which is what lets this figure show the response matrix.
+    Acts on the last axis, so it takes one alm vector, a stack of them, or the
+    transposed response matrix without changing shape anywhere else.  For a
+    real field every complex a_LM with M > 0 carries two real numbers, and the
+    real harmonics hold them as two signed coefficients:
 
-    Returns row labels (L, M) with M from -L to L, the coefficients (rows, 3),
-    and the per-sim scatter of each (rows, 3).
+        r_L0 = a_L0,  r_LM = sqrt2 (-1)^M Re a_LM,  r_L,-M = -sqrt2 (-1)^M Im a_LM.
+
+    That is a rotation of the same information, not a summary of it: one signed
+    number per mode, and sum_M r_LM^2 is the power the complex coefficients
+    carry.  It is also the basis in which L = 1 is Cartesian, which is what
+    lets the L = 1 block of the response be read as the matrix R.
     """
-    rows, vals, sds = [], [], []
-    for l in range(1, lmax + 1):
-        for m in range(-l, l + 1):
-            k = np.flatnonzero((pl == l) & (pm == abs(m)))
-            if k.size == 0:
-                continue
-            k = k[0]
-            if m == 0:
-                v, e = R[k].real, sd_re[k]
-            elif m > 0:
-                v, e = np.sqrt(2) * (-1) ** m * R[k].real, np.sqrt(2) * sd_re[k]
-            else:
-                v = -np.sqrt(2) * (-1) ** m * R[k].imag
-                e = np.sqrt(2) * sd_im[k]
-            rows.append((l, m))
-            vals.append(v)
-            sds.append(e)
-    return rows, np.array(vals, float), np.array(sds, float)
+    rows = _real_rows(pl, pm, lmax)
+    out = np.empty(np.shape(A)[:-1] + (len(rows),), dtype=float)
+    for i, (l, m) in enumerate(rows):
+        k = int(np.flatnonzero((pl == l) & (pm == abs(m)))[0])
+        if m == 0:
+            out[..., i] = A[..., k].real
+        elif m > 0:
+            out[..., i] = np.sqrt(2) * (-1) ** m * A[..., k].real
+        else:
+            out[..., i] = -np.sqrt(2) * (-1) ** m * A[..., k].imag
+    return rows, out
+
+
+def _real_basis(R, sd_re, sd_im, pl, pm, lmax):
+    """The response and its per-sim scatter in the real-harmonic basis."""
+    rows, V = _to_real(np.asarray(R).T, pl, pm, lmax)
+    # The same map applied to the scatter, whose signs carry no meaning.
+    _, E = _to_real((np.asarray(sd_re) + 1j * np.asarray(sd_im)).T,
+                    pl, pm, lmax)
+    return rows, V.T, np.abs(E).T
 
 
 def plot_alm_response(S, path):
@@ -1031,6 +996,66 @@ def plot_alm_response(S, path):
     fig.savefig(path)
     plt.close(fig)
     return path
+
+
+def _plot_noise(S, path, field):
+    """Theory signal against the noise the filters were built from.
+
+    One field per figure, both as D_l, always out to NOISE_PLOT_LMAX whatever
+    lmax happens to be, so the two are drawn on the same axis and runs with
+    different lmax stay comparable.  Where the noise crosses the signal is the
+    scale beyond which that field stops carrying information; the dotted line
+    is the atmospheric knee, where N_l is twice its white level by definition.
+    """
+    _style()
+    name, ckey, nkey, ki = field
+    cl = np.asarray(S[ckey], float)
+    nl = np.asarray(S[nkey], float)
+    t2 = _scalar(S, "tcmb_uk", 1.0) ** 2          # dimensionless -> uK^2
+    ell = np.arange(cl.size, dtype=float)
+    dfac = ell * (ell + 1.0) / (2.0 * np.pi)
+    lmin = int(_scalar(S, "lmin", 2)) or 2
+    lmax = int(_scalar(S, "lmax", cl.size - 1))
+    hi = min(NOISE_PLOT_LMAX, cl.size - 1)
+    sl = slice(2, hi + 1)
+
+    fig, ax = plt.subplots(figsize=(7.6, 5.0), layout="constrained")
+    ax.axvspan(lmin, min(lmax, hi), color=COR, alpha=0.07, lw=0, zorder=0)
+    ax.plot(ell[sl], (dfac * cl * t2)[sl], lw=1.8, color=COR,
+            label=f"$C_\\ell^{{{name}}}$")
+    ax.plot(ell[sl], (dfac * nl * t2)[sl], lw=1.8, color=RAW,
+            ls=(0, (5, 3)), label=f"$N_\\ell^{{{name}}}$")
+
+    knee = np.atleast_1d(np.asarray(S.get("ell_knee", []), float)).ravel()
+    if knee.size > ki and np.isfinite(knee[ki]) and 2 < knee[ki] < hi:
+        ax.axvline(knee[ki], color=RAW, lw=1.1, ls=(0, (1, 3)), alpha=0.9,
+                   label=r"$\ell_{\rm knee}$")
+
+    ax.set_yscale("log")
+    ax.set_xlim(0, hi)
+    d_cl = (dfac * cl * t2)[sl]
+    d_nl = (dfac * nl * t2)[sl]
+    ax.set_ylim(d_cl.max() * 1e-4, max(d_cl.max(), d_nl.max()) * 3.0)
+    ax.set_xlabel(r"multipole $\ell$")
+    ax.set_ylabel(r"$\ell(\ell+1)C_\ell/2\pi$  [$\mu$K$^2$]")
+    ax.legend(fontsize=9.5, loc="upper right", frameon=True, framealpha=0.95,
+              edgecolor="0.8")
+    ax.grid(True, which="major", color=GRID, lw=0.6, alpha=0.35)
+    ax.grid(True, which="minor", axis="y", color=GRID, lw=0.4, alpha=0.15)
+
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_noise_tt(S, path):
+    """Temperature signal and noise."""
+    return _plot_noise(S, path, ("TT", "cl_tt", "nl_tt", 0))
+
+
+def plot_noise_ee(S, path):
+    """Polarisation signal and noise."""
+    return _plot_noise(S, path, ("EE", "cl_ee", "nl_ee", 1))
 
 
 def plot_leakage(S, path):
@@ -1122,10 +1147,11 @@ def make_all(S, outdir):
     jobs = [(plot_coverage, "sky_coverage.png"),
             (plot_whisker, "velocity_whisker.png"),
             (plot_planes, "velocity_planes.png"),
-            (plot_response_sky, "response_sky.png"),
             (plot_response_matrix, "response_matrix.png"),
             (plot_amplitude, "amplitude_direction.png"),
             (plot_alm_response, "alm_response.png"),
+            (plot_noise_tt, "noise_spectra_tt.png"),
+            (plot_noise_ee, "noise_spectra_ee.png"),
             (plot_leakage, "leakage_spectrum.png")]
     done = []
     for fn, name in jobs:
