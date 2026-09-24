@@ -2,54 +2,6 @@
 Reconstruction of the CMB aberration dipole with a lensing quadratic estimator.
 
 Defaults: lmax 3000 at 3 arcmin resolution, reconstruction kept out to L = 5.
-
-The released ACT DR6 healpix mask is put onto the CAR grid with
-pixell.reproject.healpix2map(..., method="spline"), which reads the healpix map
-at each CAR pixel centre by bilinear interpolation.  That is the right choice
-for a mask: the result is a convex combination of nearby input values, so it
-cannot leave [0, 1], where the harmonic method rings around the sharp edges of
-a footprint and drives an all-positive mask negative.  --dr6-method harm and
---dr6-method average (the old area-average binning) are kept so the three can
-be compared on the same run; the printed w1, w2, w4 ratios are where to look.
-
---noise-model act replaces the flat white noise with the one ACT actually
-sees through the atmosphere,
-
-    N_l = W (1 + (l/l_knee)^alpha) / B_l^2,
-    B_l^2 = exp(-l(l+1) sigma_b^2),   sigma_b = FWHM / sqrt(8 ln 2),
-
-with W, the beam and the knees taken from --act-band and overridable one at a
-time.  Only l = 0 is pinned; the low-l tail is left alone, because it is real
-and the mask couples it into the band the estimator uses.  alpha is negative, so the bracket grows towards low l: at l = l_knee it
-is 2 by definition, and at l = 0.1 l_knee it is about 1000, which is what the
-DR6 maps paper quotes.  The values come from ACT DR6 (arXiv:2503.14451 and
-2503.14452) and are listed with their sources at ACT_BANDS below.  This makes
-everything below a few hundred useless, so --lmin is exposed alongside it;
-DR6 lensing uses 600 to 3000.  The default, white, is untouched and keys to
-the same cache as before.
-
---cmb chooses what the sims are drawn from.  The default, unlensed, is the
-original behaviour and keys to the same cache directory as before, so existing
-runs stay valid and are reused.  --cmb lensed draws phi alongside the unlensed
-CMB from one seed and deflects each realisation, so the maps carry a real
-lensing signal that the quadratic estimator responds to; one seed for both
-fields is what keeps the response pairs valid, since the two legs share the
-map and therefore the phi, and lensing cancels in their difference the way the
-mean field does.  --cmb lensed_cl is the cheap stand-in, Gaussian maps drawn
-from the lensed power spectra: it has the extra power and the smoothing but no
-lensing signal, so it will not show a lensing contribution to the
-reconstruction.  Each mode writes to its own cache directory.
-
-The response is measured with boosts along x, y and z, and reported two ways
-from exactly the same paired sims:
-
-  * the 3x3 matrix R, which is the L = 1 part, and
-  * the (L, M) response <a_LM> / (-beta) at every L out to --lout, printed as
-    the coefficients themselves rather than collapsed into a power spectrum.
-
-The second contains the first: taking the L = 1 rows of the alm response back
-through l1_vector returns R exactly, which is why both come out of one array.
-Everything above L = 1 is the leakage the boost leaves behind.
 """
 
 import os
@@ -126,8 +78,8 @@ parser.add_argument("--noise-model", default="white",
                          "cache valid.  act adds the atmospheric 1/f knee "
                          "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
                          "/ B_l^2")
-parser.add_argument("--act-band", default="coadd",
-                    choices=["f090", "f150", "f220", "coadd"],
+parser.add_argument("--act-band", default="act",
+                    choices=["f090", "f150", "f220", "coadd", "act"],
                     help="which ACT array-band the --noise-model act defaults "
                          "come from; --noise, --beam, --ell-knee and --alpha "
                          "override any of them individually")
@@ -240,6 +192,7 @@ ACT_BANDS = {
     "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
     "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
     "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
+    "act":   dict(white=14.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
 }
 # The atmosphere is a power law in both time and map domain with a slope of
 # about -3, in temperature and in polarisation alike.
