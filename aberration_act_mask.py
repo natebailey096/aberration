@@ -2,6 +2,54 @@
 Reconstruction of the CMB aberration dipole with a lensing quadratic estimator.
 
 Defaults: lmax 3000 at 3 arcmin resolution, reconstruction kept out to L = 5.
+
+The released ACT DR6 healpix mask is put onto the CAR grid with
+pixell.reproject.healpix2map(..., method="spline"), which reads the healpix map
+at each CAR pixel centre by bilinear interpolation.  That is the right choice
+for a mask: the result is a convex combination of nearby input values, so it
+cannot leave [0, 1], where the harmonic method rings around the sharp edges of
+a footprint and drives an all-positive mask negative.  --dr6-method harm and
+--dr6-method average (the old area-average binning) are kept so the three can
+be compared on the same run; the printed w1, w2, w4 ratios are where to look.
+
+--noise-model act replaces the flat white noise with the one ACT actually
+sees through the atmosphere,
+
+    N_l = W (1 + (l/l_knee)^alpha) / B_l^2,
+    B_l^2 = exp(-l(l+1) sigma_b^2),   sigma_b = FWHM / sqrt(8 ln 2),
+
+with W, the beam and the knees taken from --act-band and overridable one at a
+time.  Only l = 0 is pinned; the low-l tail is left alone, because it is real
+and the mask couples it into the band the estimator uses.  alpha is negative, so the bracket grows towards low l: at l = l_knee it
+is 2 by definition, and at l = 0.1 l_knee it is about 1000, which is what the
+DR6 maps paper quotes.  The values come from ACT DR6 (arXiv:2503.14451 and
+2503.14452) and are listed with their sources at ACT_BANDS below.  This makes
+everything below a few hundred useless, so --lmin is exposed alongside it;
+DR6 lensing uses 600 to 3000.  The default, white, is untouched and keys to
+the same cache as before.
+
+--cmb chooses what the sims are drawn from.  The default, unlensed, is the
+original behaviour and keys to the same cache directory as before, so existing
+runs stay valid and are reused.  --cmb lensed draws phi alongside the unlensed
+CMB from one seed and deflects each realisation, so the maps carry a real
+lensing signal that the quadratic estimator responds to; one seed for both
+fields is what keeps the response pairs valid, since the two legs share the
+map and therefore the phi, and lensing cancels in their difference the way the
+mean field does.  --cmb lensed_cl is the cheap stand-in, Gaussian maps drawn
+from the lensed power spectra: it has the extra power and the smoothing but no
+lensing signal, so it will not show a lensing contribution to the
+reconstruction.  Each mode writes to its own cache directory.
+
+The response is measured with boosts along x, y and z, and reported two ways
+from exactly the same paired sims:
+
+  * the 3x3 matrix R, which is the L = 1 part, and
+  * the (L, M) response <a_LM> / (-beta) at every L out to --lout, printed as
+    the coefficients themselves rather than collapsed into a power spectrum.
+
+The second contains the first: taking the L = 1 rows of the alm response back
+through l1_vector returns R exactly, which is why both come out of one array.
+Everything above L = 1 is the leakage the boost leaves behind.
 """
 
 import os
@@ -78,8 +126,8 @@ parser.add_argument("--noise-model", default="white",
                          "cache valid.  act adds the atmospheric 1/f knee "
                          "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
                          "/ B_l^2")
-parser.add_argument("--act-band", default="act",
-                    choices=["f090", "f150", "f220", "coadd", "act"],
+parser.add_argument("--act-band", default="f150",
+                    choices=["f090", "f150", "f220", "coadd"],
                     help="which ACT array-band the --noise-model act defaults "
                          "come from; --noise, --beam, --ell-knee and --alpha "
                          "override any of them individually")
@@ -89,6 +137,14 @@ parser.add_argument("--ell-knee", type=float, default=None,
 parser.add_argument("--alpha", type=float, default=None,
                     help="atmospheric slope, negative so that the term grows "
                          "towards low l (ACT measures about -3)")
+parser.add_argument("--noise-lmin", type=int, default=None,
+                    help="high-pass the simulated noise below this multipole "
+                         "(act model only; defaults to --lmin).  A ground "
+                         "telescope measures nothing at very low l, and its "
+                         "maps are filtered there, so extrapolating the 1/f "
+                         "power law to l -> 0 invents noise that is not in "
+                         "the data and that the mask couples straight back "
+                         "into the band that is used")
 parser.add_argument("--ell-knee-pol", type=float, default=None)
 parser.add_argument("--alpha-pol", type=float, default=None)
 parser.add_argument("--lmin", type=int, default=2,
@@ -192,7 +248,6 @@ ACT_BANDS = {
     "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
     "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
     "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
-    "act":   dict(white=14.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
 }
 # The atmosphere is a power law in both time and map domain with a slope of
 # about -3, in temperature and in polarisation alike.
@@ -209,6 +264,7 @@ def _pick(given, act_default, white_default):
     return act_default if NOISE_MODEL == "act" else white_default
 
 
+NOISE_LMIN = args.noise_lmin
 ELL_KNEE_T = _pick(args.ell_knee, _band["knee_T"], np.inf)
 ELL_KNEE_P = _pick(args.ell_knee_pol, _band["knee_P"], np.inf)
 ALPHA_T = _pick(args.alpha, ACT_ALPHA, 0.0)
@@ -219,6 +275,8 @@ if NOISE_MODEL == "act" and (ALPHA_T > 0 or ALPHA_P > 0):
           "-3; check the sign.", flush=True)
 
 LMIN = args.lmin
+if NOISE_LMIN is None:
+    NOISE_LMIN = LMIN
 LMAX = args.lmax
 MLMAX = LMAX + 500
 if args.res and args.res > 0:
@@ -509,6 +567,22 @@ if BEAM_FWHM_ARCMIN > 0:
 nltt[LMAX + 1:] = nltt[LMAX]
 nlee[LMAX + 1:] = nlee[LMAX]
 nlbb[LMAX + 1:] = nlbb[LMAX]
+
+if NOISE_MODEL != "white":
+    # High-pass the simulated noise.  Left to itself the 1/f power law runs to
+    # infinity as l -> 0, which puts a monopole and a dipole into every noise
+    # realisation that are larger than the CMB.  A ground-based telescope
+    # measures neither, and its maps are filtered there, so that power is not
+    # in the data.  It does real damage if it is left in: the map is masked
+    # before it is filtered, so a noise monopole m becomes m x mask, whose
+    # dipole is large for a one-sided footprint, and the estimator being
+    # quadratic then picks up a term going as m^2 along a fixed direction.
+    # The mean field removes only its average, leaving m^2 - <m^2>, a shifted
+    # chi-square with one degree of freedom: a hard edge on one side, a long
+    # tail on the other, and every outlier pointing the same way.
+    nltt[:NOISE_LMIN] = 0.0
+    nlee[:NOISE_LMIN] = 0.0
+    nlbb[:NOISE_LMIN] = 0.0
 
 ucls = {"TT": cltt, "EE": clee, "BB": clbb, "TE": clte}          # weights
 tcls = {"TT": cltt + nltt, "EE": clee + nlee,                    # filters
@@ -925,7 +999,7 @@ if args.seed_offset:
 if CMB_MODE != "unlensed":
     _config = _config + ("cmb", CMB_MODE)
 if NOISE_MODEL != "white":
-    _config = _config + ("noise", NOISE_MODEL, "v2",
+    _config = _config + ("noise", NOISE_MODEL, "v3", int(NOISE_LMIN),
                          round(float(ELL_KNEE_T), 6), round(float(ALPHA_T), 6),
                          round(float(ELL_KNEE_P), 6), round(float(ALPHA_P), 6))
 
@@ -1714,6 +1788,22 @@ def main():
         print(f"                 band {args.act_band}, l_knee "
               f"{ELL_KNEE_T:g} (T) / {ELL_KNEE_P:g} (P), alpha "
               f"{ALPHA_T:g} (T) / {ALPHA_P:g} (P)")
+        # What the noise realisations actually look like on the sky.  If the
+        # low-l tail dominates this, the map carries large-scale noise the
+        # real experiment does not have, and the mask will fold it into L=1.
+        _lax = np.arange(MLMAX + 1.0)
+        _nvar = (2 * _lax + 1) / (4 * np.pi) * nltt * TCMB_UK ** 2
+        _rms = np.sqrt(_nvar.sum())
+        print(f"                 high-passed below l = {NOISE_LMIN}; "
+              f"noise map rms {_rms:.1f} uK "
+              f"({100 * _nvar[:200].sum() / _nvar.sum():.0f}% from l < 200)")
+        if _nvar[:200].sum() > 0.5 * _nvar.sum():
+            print(f"WARNING: most of the simulated noise sits at l < 200, "
+                  f"where ACT has no data.\n"
+                  f"         The mask folds it into L=1 as a fixed-direction "
+                  f"chi-square contaminant.\n"
+                  f"         Use --lmin 600 (what DR6 lensing uses), or raise "
+                  f"--noise-lmin.", flush=True)
         # What the atmosphere actually costs, where the estimator works.
         for l in (LMIN, 500, 1000, 2000):
             if l <= LMAX:
@@ -1799,6 +1889,7 @@ def write_summary(results):
                noise_uk_arcmin=float(NOISE_UK_ARCMIN),
                beam_fwhm_arcmin=float(BEAM_FWHM_ARCMIN),
                ell_knee=np.array([ELL_KNEE_T, ELL_KNEE_P]),
+               noise_lmin=int(NOISE_LMIN),
                alpha_atm=np.array([ALPHA_T, ALPHA_P]),
                lmin=int(LMIN),
                mask_thumb=thumb, mask_thumb_dec=thumb_dec,
