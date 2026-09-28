@@ -1,9 +1,17 @@
 """
 Doppler boost of the CMB, aberration and modulation, measured with two
 quadratic estimators on the ACT DR6 lensing mask with ACT-like noise.  One
-fixed configuration; the only inputs are the numbers of simulations.
+fixed configuration; the only inputs are the numbers of simulations and,
+optionally, how to split them across jobs.
 
     python aberration_dr6.py --n-meanfield 800 --n-response 60 --n-data 400
+
+To split the sims across independent jobs (e.g. a SLURM array, --array=0-9),
+give every job the same sim counts plus
+    --nshards 10 --shard $SLURM_ARRAY_TASK_ID
+Each job makes and caches the sims i with i % nshards == shard.  When all
+have finished, run once more without --shard/--nshards: that run makes any
+sims still missing and writes the complete report and figures.
 
 Estimators, each reduced to its L = 1 vector and scaled so that on the full
 sky, for its own effect, it estimates the boost vector u = beta * d:
@@ -28,9 +36,10 @@ Every boost goes through pixell.aberration.boost_map.
 Each reconstruction is cached in cache_boost/<CACHE_TAG>/ (one file per
 sim, named by stage and index; the seeds follow the index), so an
 interrupted run resumes and a larger N only adds sims.  Give CACHE_TAG a new
-value whenever a setting changes: each tag keeps its own sims.  The raw reconstructions also go to dr6_mf<N>_resp<N>_data<N>/reconstructions.npz
-as soon as the sims finish, the results to summary.npz beside it, and the
-figures are drawn from summary.npz by aberration_dr6_plots.py.  Unlensed Gaussian CMB, homogeneous ACT
+value whenever a setting changes: each tag keeps its own sims.  Every run, shard or not, then reports on all
+sims cached so far (by any shard) and writes summary.npz and the figures
+(plots/, drawn by aberration_dr6_plots.py) into that same folder, so a shard
+that finishes early leaves a partial snapshot there.  Unlensed Gaussian CMB, homogeneous ACT
 f150 noise, noise high-passed below LMIN.
 
 DR6 lensing mask (healpix nside 4096, equatorial, ~0.8 GB):
@@ -52,6 +61,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--n-meanfield", type=int, default=800)
 parser.add_argument("--n-response", type=int, default=60)
 parser.add_argument("--n-data", type=int, default=400)
+parser.add_argument("--shard", type=int, default=0)
+parser.add_argument("--nshards", type=int, default=1)
 args = parser.parse_args()
 
 # ---------------------------------------------------------------- settings
@@ -69,7 +80,6 @@ AXES = [(0.0, 0.0), (np.pi / 2, 0.0), (0.0, np.pi / 2)]   # x, y, z as (ra, dec)
 EST = ["TT", "TE", "EE"]
 CASES = {"TT": ["TT"], "TE": ["TE"], "EE": ["EE"], "T+P": EST}
 ABER_CASE = "T+P"                         # lensing combination used for u_aber
-OUTDIR = f"dr6_mf{args.n_meanfield}_resp{args.n_response}_data{args.n_data}"
 CACHE_TAG = "alphaT-3_alphaP-4.5"         # new value whenever a setting changes
 CACHE = os.path.join("cache_boost", CACHE_TAG)     # one .npy per sim
 
@@ -203,19 +213,33 @@ def reconstruct(tqu):
     return np.array([rec[e][0][PACK_IDX] for e in EST] + [mod[PACK_IDX]])
 
 
+def cache_path(label, i):
+    return os.path.join(CACHE, f"{label.replace(' ', '_')}_{i:04d}.npy")
+
+
 def run(label, n, one_sim):
-    """Sims 0..n-1, loaded from CACHE when there and saved to it when not."""
-    out, t0 = [], time.time()
-    for i in range(n):
-        path = os.path.join(CACHE, f"{label.replace(' ', '_')}_{i:04d}.npy")
+    """Make and cache this shard's sims out of 0..n-1 (all of them with
+    --nshards 1) that are not cached yet.  Each file is written under a
+    temporary name and renamed, so no run ever reads one half-written."""
+    t0, done = time.time(), 0
+    for i in range(args.shard, n, args.nshards):
+        path = cache_path(label, i)
         if os.path.exists(path):
-            out.append(np.load(path))
-        else:
-            out.append(one_sim(i))
-            np.save(path, out[-1])
-        print(f"   {label} {i + 1}/{n}   {(time.time() - t0) / (i + 1):.1f} "
+            continue
+        tmp = f"{path}.{os.getpid()}.npy"
+        np.save(tmp, one_sim(i))
+        os.replace(tmp, path)
+        done += 1
+        print(f"   {label} {i + 1}/{n}   {(time.time() - t0) / done:.1f} "
               f"s/sim", flush=True)
-    return np.array(out)
+
+
+def collect(labels, n):
+    """The sims 0..n-1 cached for every one of labels, by any shard, as an
+    array (label, sim, ...).  A response sim counts once all its legs are in."""
+    idx = [i for i in range(n)
+           if all(os.path.exists(cache_path(l, i)) for l in labels)]
+    return np.array([[np.load(cache_path(l, i)) for i in idx] for l in labels])
 
 
 # ---------------------------------------------------------------- analysis
@@ -267,34 +291,45 @@ def galactic(v):
             np.degrees(np.arcsin(np.clip(g[..., 2], -1, 1))))
 
 
-def report(name, u, null, n_m):
-    """Amplitude, velocity and direction of one estimate of u, printed."""
-    amp = u @ U_TRUE / (U_TRUE @ U_TRUE)
-    dirs = u / np.linalg.norm(u, axis=1)[:, None]
-    vel = u * C_KMS
-    shrink = np.sqrt(1.0 / len(u) + 1.0 / n_m)     # mean-field error is shared
-    ang = np.degrees(np.arccos(np.clip(dirs @ D_TRUE, -1, 1)))
-    mean_dir = u.mean(axis=0) / np.linalg.norm(u.mean(axis=0))
-    sd_v = vel.std(axis=0, ddof=1)
-    h = n_m // 2
-    print(f"\n{name}")
-    print(f"   A = {amp.mean():+.4f} +- {amp.std(ddof=1):.4f} (sd), "
-          f"+- {amp.std(ddof=1) * shrink:.4f} (error on the mean)   expect 1")
-    print(f"   null A = {(null @ U_TRUE).mean() / (U_TRUE @ U_TRUE):+.4f} +- "
-          f"{(null @ U_TRUE).std(ddof=1) / (U_TRUE @ U_TRUE) * np.sqrt(1 / len(null) + 1 / h):.4f}"
+STATS = ["A", "v_x", "v_y", "v_z", "l", "b"]        # per-sim statistics
+
+
+def stats(u):
+    """Per-sim u (n, 3) -> amplitude A, velocity in km/s, and the galactic
+    l, b of its direction in degrees (l unwrapped around the input)."""
+    l_in = galactic(D_TRUE)[0]
+    l, b = galactic(u / np.linalg.norm(u, axis=1)[:, None])
+    return np.column_stack([u @ U_TRUE / (U_TRUE @ U_TRUE), u * C_KMS,
+                            l_in + (l - l_in + 180) % 360 - 180, b])
+
+
+def report(title, e):
+    """Print one estimate and return what the summary keeps of it."""
+    mean, sd, err, part = e["mean"], e["sd"], e["err"], e["err_parts"]
+    dirs = e["u"] / np.linalg.norm(e["u"], axis=1)[:, None]
+    ubar = e["u"].mean(axis=0) / np.linalg.norm(e["u"].mean(axis=0))
+    l_in, b_in = galactic(D_TRUE)
+    v_in = C_KMS * U_TRUE
+    print(f"\n{title}")
+    print(f"   A = {mean[0]:+.4f} +- {sd[0]:.4f} (sd), +- {err[0]:.4f} "
+          f"(error on the mean)   expect 1")
+    print(f"       error on the mean from data {part[0, 0]:.4f}, mean field "
+          f"{part[1, 0]:.4f}, response {part[2, 0]:.4f}")
+    print(f"   null A = {e['null'].mean():+.4f} +- {e['null_err']:.4f}"
           f"   expect 0")
     print("   v [km/s]  " + "   ".join(
-        f"{'xyz'[k]} {vel[:, k].mean():+7.1f} +- {sd_v[k] * shrink:5.1f} "
-        f"(in {C_KMS * U_TRUE[k]:+6.1f})" for k in range(3)))
-    print(f"   direction: mean {np.degrees(np.arccos(np.clip(mean_dir @ D_TRUE, -1, 1))):.1f} deg "
-          f"from input, per sim median {np.median(ang):.1f} deg")
-    l_in, b_in = galactic(D_TRUE)
-    l, b = galactic(dirs)
-    l = l_in + (l - l_in + 180) % 360 - 180        # unwrapped around the input
-    print(f"   galactic: l = {l.mean():.2f} +- {l.std(ddof=1):.2f}, "
-          f"b = {b.mean():+.2f} +- {b.std(ddof=1):.2f} (mean +- sd);  "
+        f"{'xyz'[k]} {mean[k + 1]:+7.1f} +- {err[k + 1]:5.1f} "
+        f"(in {v_in[k]:+6.1f})" for k in range(3)))
+    print(f"   galactic  l = {mean[4]:.2f} +- {err[4]:.2f} (sd {sd[4]:.2f}), "
+          f"b = {mean[5]:+.2f} +- {err[5]:.2f} (sd {sd[5]:.2f});  "
           f"input l = {l_in:.2f}, b = {b_in:+.2f}")
-    return dict(amp=amp, dir=dirs, vel=vel, null=null @ U_TRUE / (U_TRUE @ U_TRUE))
+    print(f"   mean velocity "
+          f"{np.degrees(np.arccos(np.clip(ubar @ D_TRUE, -1, 1))):.1f} deg "
+          f"from the input, single sims median "
+          f"{np.median(np.degrees(np.arccos(np.clip(dirs @ D_TRUE, -1, 1)))):.1f} deg")
+    return dict(amp=e["stats"][:, 0], vel=e["stats"][:, 1:4], dir=dirs,
+                null=e["null"], null_err=e["null_err"], stat_mean=mean,
+                stat_sd=sd, stat_err=err, stat_err_parts=part)
 
 
 def higher_l(Y, own):
@@ -314,18 +349,59 @@ def higher_l(Y, own):
                 noise=cl_of(var_m))
 
 
-def analyse(mf, diff, dat):
-    Y, y_mf, y_dat, K, Kerr = system((ABER_CASE, "MOD"), mf, diff, dat)
-    n_m = len(y_mf)
-    m = y_mf.mean(axis=0)
-    C = np.cov(y_mf, rowvar=False)
+def linear_maps(K, C):
+    """3x6 maps from the estimator vectors (mean field removed) to u: rows of
+    K^-1 for the separate estimates, and for the joint one the least-squares
+    fit of one u to both effects, weighted by the covariance C."""
     Kinv = np.linalg.inv(K)
     Kj = K[:, :3] + K[:, 3:]                   # one u drives both effects
     G = np.linalg.solve(Kj.T @ np.linalg.solve(C, Kj),
                         np.linalg.solve(C, Kj).T)
+    return {"aberration": Kinv[:3], "modulation": Kinv[3:], "joint": G}
+
+
+def solve(names, mf, diff, dat):
+    """The three estimates of u from one pair of estimators, with the mean,
+    sd and error on the mean of their per-sim statistics.  The error on the
+    mean has three independent parts: the scatter of the data sims, and, by
+    jackknife, the mean field and K, which every data sim shares."""
+    Y, y_mf, y_dat, K, Kerr = system(names, mf, diff, dat)
+    n_m, n_r = len(y_mf), diff.shape[2]
+    m, C = y_mf.mean(axis=0), np.cov(y_mf, rowvar=False)
+
+    def means(m, C, K):
+        L = linear_maps(K, C)
+        return {e: stats((y_dat - m) @ L[e].T).mean(axis=0) for e in L}
+
+    jk_mf = [means(r.mean(axis=0), np.cov(r, rowvar=False), K)
+             for r in (np.delete(y_mf, k, axis=0) for k in range(n_m))]
+    K_jk = [system(names, mf, np.delete(diff, k, axis=2), dat)[3]
+            for k in range(n_r)]
+    jk_resp = [means(m, C, Kk) for Kk in K_jk]
+
+    L = linear_maps(K, C)
     h = n_m // 2
-    null = y_mf[h:] - y_mf[:h].mean(axis=0)
-    sep, sep_null = (y_dat - m) @ Kinv.T, null @ Kinv.T
+    null_y = y_mf[h:] - y_mf[:h].mean(axis=0)     # split-half null test
+    est = {}
+    for e in L:
+        u = (y_dat - m) @ L[e].T
+        st = stats(u)
+        var = np.array([st.var(axis=0, ddof=1) / len(st),
+                        (n_m - 1) * np.var([j[e] for j in jk_mf], axis=0),
+                        (n_r - 1) * np.var([j[e] for j in jk_resp], axis=0)])
+        null = null_y @ L[e].T @ U_TRUE / (U_TRUE @ U_TRUE)
+        est[e] = dict(u=u, stats=st, mean=st.mean(axis=0),
+                      sd=st.std(axis=0, ddof=1), err=np.sqrt(var.sum(axis=0)),
+                      err_parts=np.sqrt(var), null=null,
+                      null_err=null.std(ddof=1) * np.sqrt(1 / len(null) + 1 / h))
+    return Y, K, Kerr, m, C, est, K_jk
+
+
+def analyse(mf, diff, dat):
+    Y, K, Kerr, m, C, est, K_jk = solve((ABER_CASE, "MOD"), mf, diff, dat)
+    Kj = K[:, :3] + K[:, 3:]
+    mf_ratio = np.array([np.linalg.norm(m[i:i + 3])
+                         / np.linalg.norm(Kj[i:i + 3] @ U_TRUE) for i in (0, 3)])
 
     print(f"\nresponse K per unit u: rows {ABER_CASE} QE xyz, MOD QE xyz; "
           f"columns aberration xyz, modulation xyz")
@@ -333,28 +409,30 @@ def analyse(mf, diff, dat):
         print("   " + " ".join(f"{K[i, j]:+.3f}({Kerr[i, j] * 1e3:3.0f})"
                                for j in range(6)))
     print(f"   (MC error on the mean in units of 1e-3; b = {B_NU:.4f})")
-    print(f"   |mean field| / |K u_in|:  {ABER_CASE} "
-          f"{np.linalg.norm(m[:3]) / np.linalg.norm(Kj[:3] @ U_TRUE):.1f},  "
-          f"MOD {np.linalg.norm(m[3:]) / np.linalg.norm(Kj[3:] @ U_TRUE):.1f}")
+    print(f"   |mean field| / |K u_in|:  {ABER_CASE} {mf_ratio[0]:.1f},  "
+          f"MOD {mf_ratio[1]:.1f}")
 
-    out = {"aberration": report("aberration (separate)", sep[:, :3],
-                                sep_null[:, :3], n_m),
-           "modulation": report("modulation (separate)", sep[:, 3:],
-                                sep_null[:, 3:], n_m),
-           "joint": report("joint (one u for both effects)",
-                           (y_dat - m) @ G.T, null @ G.T, n_m)}
+    titles = {"aberration": "aberration (separate)",
+              "modulation": "modulation (separate)",
+              "joint": "joint (one u for both effects)"}
+    out = {name: report(title, est[name]) for name, title in titles.items()}
     for i, name in enumerate(("aberration", "modulation")):
-        out[name].update(higher_l(Y[i], i), R=K[3 * i:3 * i + 3, 3 * i:3 * i + 3],
-                         Rerr=Kerr[3 * i:3 * i + 3, 3 * i:3 * i + 3])
+        blk = np.s_[3 * i:3 * i + 3, 3 * i:3 * i + 3]
+        eig = [np.linalg.eigvalsh(0.5 * (Kk[blk] + Kk[blk].T)) for Kk in K_jk]
+        out[name].update(higher_l(Y[i], i), R=K[blk], Rerr=Kerr[blk],
+                         eig_err=np.sqrt((len(eig) - 1) * np.var(eig, axis=0)))
     sd = np.sqrt(np.diag(C))
-    out["system"] = dict(K=K, Kerr=Kerr, corr=C / np.outer(sd, sd))
+    out["system"] = dict(K=K, Kerr=Kerr, corr=C / np.outer(sd, sd),
+                         mf_ratio=mf_ratio)
 
     print("\nseparate aberration amplitude for each lensing combination")
+    rows = []
     for case in CASES:
-        _, ym, yd, Kc, _ = system((case, "MOD"), mf, diff, dat)
-        a = ((yd - ym.mean(axis=0)) @ np.linalg.inv(Kc).T)[:, :3] @ U_TRUE
-        a /= U_TRUE @ U_TRUE
-        print(f"   {case:4s}  A = {a.mean():+.3f} +- {a.std(ddof=1):.3f} (sd)")
+        e = solve((case, "MOD"), mf, diff, dat)[5]["aberration"]
+        rows.append([e["mean"][0], e["err"][0], e["sd"][0]])
+        print(f"   {case:4s}  A = {e['mean'][0]:+.4f} +- {e['sd'][0]:.4f} (sd), "
+              f"+- {e['err'][0]:.4f} (error on the mean)")
+    out["lensing_cases"] = dict(names=np.array(list(CASES)), A=np.array(rows))
     return out
 
 
@@ -365,35 +443,49 @@ def main():
           f"dec {np.degrees(BDIR[1]):.2f}; modulation b = {B_NU:.4f} at "
           f"{FREQ / 1e9:g} GHz", flush=True)
 
-    print(f"noise 1/f slopes T {ALPHA_T:g}, P {ALPHA_P:g}; cache {CACHE}/")
+    print(f"noise 1/f slopes T {ALPHA_T:g}, P {ALPHA_P:g}; cache {CACHE}/"
+          + (f"; shard {args.shard} of {args.nshards}" if args.nshards > 1
+             else ""))
     os.makedirs(CACHE, exist_ok=True)
     print("\n[A] mean field")
-    mf = run("mf", args.n_meanfield, lambda i: reconstruct(
+    run("mf", args.n_meanfield, lambda i: reconstruct(
         cmb(1_000_000 + 2 * i) + noise(1_000_001 + 2 * i)))
 
     print("\n[B] response")
-    diff = np.zeros((2, 3, args.n_response) + mf.shape[1:], complex)
+    labels = []
     for k, effect in enumerate(("aberration", "modulation")):
         for j, d in enumerate(AXES):
-            legs = [run(f"{effect} {'xyz'[j]}{'+-'[s < 0]}", args.n_response,
-                        lambda i: reconstruct(boost(
-                            cmb(2_000_000 + i), d, s * BETA,
-                            aberrate=k == 0, modulate=k == 1)))
-                    for s in (1, -1)]
-            diff[k, j] = (legs[0] - legs[1]) / 2
+            for s in (1, -1):
+                labels.append(f"{effect} {'xyz'[j]}{'+-'[s < 0]}")
+                run(labels[-1], args.n_response, lambda i: reconstruct(boost(
+                    cmb(2_000_000 + i), d, s * BETA,
+                    aberrate=k == 0, modulate=k == 1)))
 
     print("\n[C] data")
-    dat = run("data", args.n_data, lambda i: reconstruct(
+    run("data", args.n_data, lambda i: reconstruct(
         boost(cmb(3_000_000 + 2 * i), BDIR, BETA) + noise(3_000_001 + 2 * i)))
 
-    os.makedirs(OUTDIR, exist_ok=True)
-    np.savez(os.path.join(OUTDIR, "reconstructions.npz"), mf=mf, diff=diff,
-             data=dat)
+    # Report on everything cached so far, whichever shard made it.
+    mf = collect(["mf"], args.n_meanfield)[0]
+    legs = collect(labels, args.n_response)            # (12 legs, sim, ...)
+    diff = (legs[0::2] - legs[1::2]).reshape((2, 3) + legs.shape[1:]) / 2
+    dat = collect(["data"], args.n_data)[0]
+    counts = (len(mf), diff.shape[2], len(dat))
+    print(f"\ncollected {counts[0]}/{args.n_meanfield} mean-field, "
+          f"{counts[1]}/{args.n_response} response and "
+          f"{counts[2]}/{args.n_data} data sims")
+    if counts[0] < 8 or counts[1] < 3 or counts[2] < 2:
+        print("too few for a report yet: run the remaining shards")
+        return
+    if counts != (args.n_meanfield, args.n_response, args.n_data):
+        print("partial: the report and figures cover the sims cached so far")
     results = analyse(mf, diff, dat)
 
     thumb = enmap.downgrade(mask, max(1, round(0.5 * utils.degree / RES)))
     dec, ra = enmap.posaxes(thumb.shape, thumb.wcs)
-    out = dict(v_true=C_KMS * U_TRUE, d_true=D_TRUE, beta=BETA, b_nu=B_NU,
+    out = dict(v_true=C_KMS * U_TRUE, d_true=D_TRUE, beta=BETA, b_nu=B_NU, freq=FREQ, res_arcmin=RES / utils.arcmin,
+               noise_t=NOISE_T, beam=BEAM, cache_tag=CACHE_TAG, stat_names=STATS,
+               requested=[args.n_meanfield, args.n_response, args.n_data],
                n_mf=len(mf), n_resp=diff.shape[2], n_data=len(dat),
                lmin=LMIN, lmax=LMAX, knee=[KNEE_T, KNEE_P], alpha=[ALPHA_T, ALPHA_P], tcmb=TCMB,
                cl_tt=cltt, cl_ee=clee, nl_tt=nltt, nl_ee=nlee,
@@ -403,11 +495,14 @@ def main():
     for name, res in results.items():
         for key, val in res.items():
             out[f"{name}.{key}"] = val
-    np.savez(os.path.join(OUTDIR, "summary.npz"), **out)
-    print(f"\nwrote {OUTDIR}/summary.npz")
+    path = os.path.join(CACHE, "summary.npz")
+    tmp = f"{path}.{os.getpid()}.npz"
+    np.savez(tmp, **out)
+    os.replace(tmp, path)
+    print(f"\nwrote {path}")
 
     import aberration_dr6_plots
-    aberration_dr6_plots.make_all(os.path.join(OUTDIR, "summary.npz"))
+    aberration_dr6_plots.make_all(path)             # -> CACHE/plots
 
 
 if __name__ == "__main__":
