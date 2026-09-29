@@ -217,10 +217,18 @@ def cache_path(label, i):
     return os.path.join(CACHE, f"{label.replace(' ', '_')}_{i:04d}.npy")
 
 
+RESP_LABELS = [f"{effect} {axis}{sign}" for effect in ("aberration", "modulation")
+               for axis in "xyz" for sign in "+-"]
+STAGE = {"mf": "mf", "data": "data", **{l: "response" for l in RESP_LABELS}}
+TODO = {}           # sims this run still has to make, per label (set in main)
+
+
 def run(label, n, one_sim):
     """Make and cache this shard's sims out of 0..n-1 (all of them with
     --nshards 1) that are not cached yet.  Each file is written under a
-    temporary name and renamed, so no run ever reads one half-written."""
+    temporary name and renamed, so no run ever reads one half-written.
+    The time left assumes every remaining sim, of any stage, takes as long
+    as the average so far in this call."""
     t0, done = time.time(), 0
     for i in range(args.shard, n, args.nshards):
         path = cache_path(label, i)
@@ -230,8 +238,13 @@ def run(label, n, one_sim):
         np.save(tmp, one_sim(i))
         os.replace(tmp, path)
         done += 1
-        print(f"   {label} {i + 1}/{n}   {(time.time() - t0) / done:.1f} "
-              f"s/sim", flush=True)
+        TODO[label] -= 1
+        rate = (time.time() - t0) / done
+        stage_left = sum(v for l, v in TODO.items() if STAGE[l] == STAGE[label])
+        print(f"   {label} {i + 1}/{n}   {rate:.1f} s/sim "
+              f"{rate * stage_left / 60:.1f} min left ({STAGE[label]}) "
+              f"{rate * sum(TODO.values()) / 60:.1f} min left (total)",
+              flush=True)
 
 
 def collect(labels, n):
@@ -447,17 +460,23 @@ def main():
           + (f"; shard {args.shard} of {args.nshards}" if args.nshards > 1
              else ""))
     os.makedirs(CACHE, exist_ok=True)
+    counts = {"mf": args.n_meanfield, "data": args.n_data,
+              **{l: args.n_response for l in RESP_LABELS}}
+    TODO.update({l: sum(not os.path.exists(cache_path(l, i))
+                        for i in range(args.shard, n, args.nshards))
+                 for l, n in counts.items()})
+    print(f"this run makes {sum(TODO.values())} sims; the rest are cached "
+          f"or belong to other shards")
     print("\n[A] mean field")
     run("mf", args.n_meanfield, lambda i: reconstruct(
         cmb(1_000_000 + 2 * i) + noise(1_000_001 + 2 * i)))
 
     print("\n[B] response")
-    labels = []
     for k, effect in enumerate(("aberration", "modulation")):
         for j, d in enumerate(AXES):
             for s in (1, -1):
-                labels.append(f"{effect} {'xyz'[j]}{'+-'[s < 0]}")
-                run(labels[-1], args.n_response, lambda i: reconstruct(boost(
+                run(f"{effect} {'xyz'[j]}{'+-'[s < 0]}", args.n_response,
+                    lambda i: reconstruct(boost(
                     cmb(2_000_000 + i), d, s * BETA,
                     aberrate=k == 0, modulate=k == 1)))
 
@@ -467,7 +486,7 @@ def main():
 
     # Report on everything cached so far, whichever shard made it.
     mf = collect(["mf"], args.n_meanfield)[0]
-    legs = collect(labels, args.n_response)            # (12 legs, sim, ...)
+    legs = collect(RESP_LABELS, args.n_response)            # (12 legs, sim, ...)
     diff = (legs[0::2] - legs[1::2]).reshape((2, 3) + legs.shape[1:]) / 2
     dat = collect(["data"], args.n_data)[0]
     counts = (len(mf), diff.shape[2], len(dat))

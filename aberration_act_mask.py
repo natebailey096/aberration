@@ -126,8 +126,8 @@ parser.add_argument("--noise-model", default="white",
                          "cache valid.  act adds the atmospheric 1/f knee "
                          "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
                          "/ B_l^2")
-parser.add_argument("--act-band", default="act",
-                    choices=["f090", "f150", "f220", "coadd", "act"],
+parser.add_argument("--act-band", default="f150",
+                    choices=["f090", "f150", "f220", "coadd"],
                     help="which ACT array-band the --noise-model act defaults "
                          "come from; --noise, --beam, --ell-knee and --alpha "
                          "override any of them individually")
@@ -248,7 +248,6 @@ ACT_BANDS = {
     "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
     "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
     "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
-    "act": dict(white=14.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
 }
 # The atmosphere is a power law in both time and map domain with a slope of
 # about -3, in temperature and in polarisation alike.
@@ -1387,10 +1386,15 @@ def alm_response(S):
 
 
 def response_matrix(S):
-    """The 3x3 response, its per-sim scatter, and the error on its mean.
+    """The 3x3 response, its per-sim scatter, the error on its mean, and the
+    per-sim ensemble V itself.
 
     Read off the L=1 rows of the same S the alm response uses, so the matrix
-    and the (L,M) table can never drift apart.
+    and the (L,M) table can never drift apart.  V is returned (not just its
+    mean and scatter) because propagating R's sampling error into a velocity
+    or amplitude needs the covariance of V @ u for whatever vector u that
+    quantity's own gradient turns out to be, and that can't be built from
+    per-element statistics alone.
     """
     n = len(S)
     V = np.empty((n, 3, 3))
@@ -1399,7 +1403,7 @@ def response_matrix(S):
             V[a, :, j] = l1_vector(S[a, :, j])
     R = V.mean(axis=0)
     sd = V.std(axis=0, ddof=1)
-    return R, sd, sd / np.sqrt(n)
+    return R, sd, sd / np.sqrt(n), V
 
 
 # 7b. Leakage into L >= 2
@@ -1571,7 +1575,7 @@ def analyse(case, mf_vecs, diffs, data_vecs):
 
     S = response_alm(diffs, case)
     ar = alm_response(S)
-    R, Rsd, dR = response_matrix(S)
+    R, Rsd, dR, Vresp = response_matrix(S)
     Rinv = np.linalg.inv(R)
     scale = np.max(np.abs(R))
     print(f"response matrix R, from {ar['n']} paired sims per axis")
@@ -1613,6 +1617,49 @@ def analyse(case, mf_vecs, diffs, data_vecs):
     velraw = -(dat - mf) * C_KMS                # the same without R^-1
     n_dat = len(amps)
 
+    # Error on the mean velocity, from all three independent sim ensembles.
+    #
+    # mean(vel) = Rinv @ (mf - mean(dat)) * (-C_KMS) is a function of three
+    # quantities drawn from three separate seed bases -- the data mean, the
+    # mean field, and R itself -- so their contributions to its covariance
+    # add.  Each is propagated to first order, holding the other two fixed at
+    # their central estimate:
+    #
+    #   data:  vel_i = Rinv @ velraw_i for fixed Rinv, mf, so
+    #          Cov(mean(vel))_data = Cov(vel_i) / n_dat -- already exactly
+    #          what the per-component sd/sqrt(n_dat) below measures.
+    #   mean field:  d(mean(a_hat))/d(mf) = -Rinv, exact and linear, so
+    #          Cov(mean(vel))_mf = C_KMS^2 Rinv Cov(mf_all) Rinv^T / n_mf,
+    #          using the scatter of the raw per-sim mean-field vectors.
+    #   response:  R -> R + dR gives Rinv -> Rinv - Rinv dR Rinv to first
+    #          order, so d(a_hat) = -Rinv @ dR @ u where u = mean(a_hat) is
+    #          the point the derivative is taken at.  dR has the same
+    #          covariance as V (the per-sim response-matrix ensemble) divided
+    #          by n_resp, so Cov(dR @ u) is the sample covariance, across
+    #          response sims, of w_a = V[a] @ u, divided by n_resp.
+    #
+    # All three are independent by construction (separate "meanfield",
+    # "response", "data" seed bases), so their variances simply add.
+    u = a_hats.mean(axis=0)
+    if n_mf > 1:
+        mf_cov_raw = np.cov(mf_all, rowvar=False)
+    else:
+        mf_cov_raw = np.zeros((3, 3))
+    mf_err_cov = (C_KMS ** 2) * (Rinv @ mf_cov_raw @ Rinv.T) / max(n_mf, 1)
+
+    n_resp_used = len(Vresp)
+    W = np.einsum("aqr,r->aq", Vresp, u)
+    if n_resp_used > 1:
+        W_cov = np.cov(W, rowvar=False)
+    else:
+        W_cov = np.zeros((3, 3))
+    resp_err_cov = ((C_KMS ** 2) * (Rinv @ W_cov @ Rinv.T)
+                    / max(n_resp_used, 1))
+
+    data_err_cov = np.cov(vel, rowvar=False) / max(n_dat, 1)
+    vel_err_cov = data_err_cov + mf_err_cov + resp_err_cov
+    vel_sem = np.sqrt(np.clip(np.diag(vel_err_cov), 0.0, None))
+
     sigma = amps.std(ddof=1)
     err_mean = sigma * np.sqrt(1.0 / n_dat + 1.0 / n_mf)   # includes MF noise
 
@@ -1647,12 +1694,17 @@ def analyse(case, mf_vecs, diffs, data_vecs):
     for k in range(3):
         nm = "xyz"[k]
         m = vel[:, k].mean()
-        sem = vel[:, k].std(ddof=1) / np.sqrt(n_dat)
         sd = vel[:, k].std(ddof=1)
+        sem = vel_sem[k]
+        sem_data = np.sqrt(data_err_cov[k, k])
         print(f"   v{nm}   = {m:+9.2f} +- {sd:8.2f} (sd)   "
-              f"+- {sem:6.2f} (on the mean)   "
+              f"+- {sem:6.2f} (on the mean: data + MF + response)   "
               f"residual {m - V_TRUE_KMS[k]:+7.2f} "
               f"({(m - V_TRUE_KMS[k]) / sem:+.1f} sigma)")
+        if sem > 1.05 * sem_data:
+            print(f"          data sims alone would read +-{sem_data:6.2f}; "
+                  f"mean field and response add "
+                  f"{100 * (sem / sem_data - 1):.0f}% to that")
 
     print(f"\ndirection")
     print(f"   mean of {n_dat} sims     = ra {ra_m:6.1f} deg, "
@@ -1688,7 +1740,9 @@ def analyse(case, mf_vecs, diffs, data_vecs):
                 Ralm=ar["R"], Ralm_sd_re=ar["sd_re"], Ralm_sd_im=ar["sd_im"],
                 leak=leak["cl"], leakerr=leak["err"],
                 noise=noise, mfcl=mfcl, datleak=datleak, n_dat=n_dat,
-                n_mf=n_mf, n_resp=ar["n"])
+                n_mf=n_mf, n_resp=ar["n"],
+                vel_err_cov=vel_err_cov, vel_err_data=data_err_cov,
+                vel_err_mf=mf_err_cov, vel_err_resp=resp_err_cov)
 
 
 def sim_budget(results, n_resp):
@@ -1899,7 +1953,9 @@ def write_summary(results):
 
     per_case_keys = ["vel", "velraw", "amp", "naive", "dir", "R",
                      "Rsd", "Rerr", "Ralm", "Ralm_sd_re", "Ralm_sd_im",
-                     "leak", "leakerr", "noise", "mfcl", "datleak"]
+                     "leak", "leakerr", "noise", "mfcl", "datleak",
+                     "vel_err_cov", "vel_err_data", "vel_err_mf",
+                     "vel_err_resp"]
     for k in range(len(cases)):
         r = results[cases[k]]
         for key in per_case_keys:

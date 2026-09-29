@@ -196,7 +196,8 @@ def load(path, case="T+P"):
     out["cases"], out["case"] = cases, case
     for name in ("vel", "velraw", "amp", "naive", "dir", "R", "Rsd", "Rerr",
                  "Ralm", "Ralm_sd_re", "Ralm_sd_im", "leak",
-                 "leakerr", "noise", "mfcl", "datleak"):
+                 "leakerr", "noise", "mfcl", "datleak",
+                 "vel_err_cov", "vel_err_data", "vel_err_mf", "vel_err_resp"):
         if f"{name}_{k}" in d:
             out[name] = d[f"{name}_{k}"]
     return out
@@ -622,11 +623,23 @@ def plot_whisker(S, path):
     the mean +- 2, so the figure quotes the same numbers as the printout
     rather than quartiles.  The uncorrected estimator is not drawn here, nor
     on any other figure; the pipeline still prints it.
+
+    The error bar on the mean combines all three sim ensembles the mean
+    actually depends on -- data, mean field, and the response matrix -- not
+    just the data sims' own scatter.  See vel_err_cov in the pipeline's
+    analyse() for the derivation; summaries written before that existed fall
+    back to the data-only figure, i.e. sd / sqrt(n_data).
     """
     _style()
     v_true = np.asarray(S["v_true"], float)
     vel = np.asarray(S["vel"], float)
     n = len(vel)
+    err_cov = S.get("vel_err_cov")
+    if err_cov is not None:
+        vel_sem = np.sqrt(np.clip(np.diag(np.asarray(err_cov, float)), 0, None))
+    else:
+        vel_sem = np.array([vel[:, k].std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+                            for k in range(3)])
 
     fig, (ax0, ax1) = plt.subplots(
         2, 1, figsize=(8.0, 6.6), sharex=True,
@@ -635,7 +648,7 @@ def plot_whisker(S, path):
     for k in range(3):
         _boxes(ax0, [vel[:, k]], [k], 0.42, COR)
         m = vel[:, k].mean()
-        sem = vel[:, k].std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+        sem = vel_sem[k]
         ax0.errorbar([k], [m], yerr=[sem], fmt="o", ms=5.0, color=INK,
                      mfc="white", mew=1.2, elinewidth=1.4, capsize=2.8,
                      zorder=6)
@@ -668,7 +681,10 @@ def plot_whisker(S, path):
                      label="$R^{-1}$ corrected"),
                Line2D([], [], color=TRUTH, lw=2.0, label="input"),
                Line2D([], [], color=INK, marker="o", ls="none",
-                      mfc="white", label="mean $\\pm$ error on the mean")]
+                      mfc="white",
+                      label="mean $\\pm$ error on the mean (data + MF + "
+                            "response)" if err_cov is not None else
+                            "mean $\\pm$ error on the mean (data sims only)")]
     ax0.legend(handles=handles, ncol=1, loc="upper left", fontsize=9.5,
                frameon=True, framealpha=0.9, borderpad=0.6)
     fig.savefig(path)

@@ -227,12 +227,10 @@ def plot_whisker(S, path):
     ax0.set_title(TITLES[S["name"]])
     ax0.legend(loc="upper left")
     ax1.errorbar(range(3), m - v_true, yerr=err, fmt="o", color=col,
-                 capsize=4, label="mean - input, +- error on the mean "
-                 "(data, mean-field and response sims)")
+                 capsize=4)
     ax1.axhline(0, color=TRUTH)
     ax1.set_ylabel("residual [km/s]")
     ax1.set_xticks(range(3), ["$v_x$", "$v_y$", "$v_z$"])
-    ax1.legend(fontsize=8)
     fig.savefig(path)
     plt.close(fig)
 
@@ -295,7 +293,8 @@ def plot_response_matrix(S, path):
 
 def plot_amplitude_direction(S, path):
     """Amplitude A, and the recovered directions in galactic coordinates:
-    per-sim directions, their mean +- 1 sd in l and b, and the input."""
+    per-sim directions with 1 and 2 sd ellipses, their mean, and the
+    input; the text box gives the mean and sd in l and b."""
     amp = S["amp"]
     col = COLOURS[S["name"]]
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 4.8),
@@ -323,9 +322,7 @@ def plot_amplitude_direction(S, path):
     ax1.scatter(l, b, s=14, color=col, alpha=0.55, lw=0, label="per sim")
     for ns in (1, 2):
         ellipse(ax1, (lm, bm), np.cov(l, b), ns, color=col, ls="--", lw=1)
-    ax1.errorbar(lm, bm, xerr=sl, yerr=sb, fmt="o", ms=7, color=col,
-                 mec=INK, elinewidth=2, capsize=4, zorder=5,
-                 label="mean $\\pm$ 1 sd")
+    ax1.plot(lm, bm, "o", ms=8, color=col, mec=INK, zorder=5, label="mean")
     ax1.plot(l_in, b_in, "*", ms=16, color=TRUTH, zorder=6, label="input")
     ax1.invert_xaxis()
     ax1.set_aspect(1 / np.cos(np.radians(b_in)), adjustable="datalim")
