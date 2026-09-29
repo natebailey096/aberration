@@ -70,7 +70,7 @@ MASK_FILE = "mask_act_dr6_lensing_v1_healpix_nside_4096_baseline.fits"
 LMIN, LMAX, MLMAX = 600, 3000, 3500
 LOUT = 5                                  # highest reconstruction L kept
 RES = 3.0 * utils.arcmin                  # fejer1 grid: exact SHTs to l = 3599
-NOISE_T, BEAM = 24.0, 1.42                # uK-arcmin (T; P is sqrt2 x), FWHM arcmin
+NOISE_T, BEAM = 14.0, 1.42                # uK-arcmin (T; P is sqrt2 x), FWHM arcmin
 KNEE_T, KNEE_P = 3000.0, 475.0            # 1/f knees
 ALPHA_T, ALPHA_P = -3.0, -4.5             # 1/f slopes
 FREQ = 150e9                              # Hz; sets the modulation factor b
@@ -80,7 +80,7 @@ AXES = [(0.0, 0.0), (np.pi / 2, 0.0), (0.0, np.pi / 2)]   # x, y, z as (ra, dec)
 EST = ["TT", "TE", "EE"]
 CASES = {"TT": ["TT"], "TE": ["TE"], "EE": ["EE"], "T+P": EST}
 ABER_CASE = "T+P"                         # lensing combination used for u_aber
-CACHE_TAG = "alphaT-3_alphaP-4.5"         # new value whenever a setting changes
+CACHE_TAG = "firsttry"         # new value whenever a setting changes
 CACHE = os.path.join("cache_boost", CACHE_TAG)     # one .npy per sim
 
 X_NU = utils.h * FREQ / (utils.k * utils.T_cmb)
