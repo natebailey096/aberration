@@ -126,8 +126,8 @@ parser.add_argument("--noise-model", default="white",
                          "cache valid.  act adds the atmospheric 1/f knee "
                          "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
                          "/ B_l^2")
-parser.add_argument("--act-band", default="f150",
-                    choices=["f090", "f150", "f220", "coadd"],
+parser.add_argument("--act-band", default="act",
+                    choices=["f090", "f150", "f220", "coadd", "act"],
                     help="which ACT array-band the --noise-model act defaults "
                          "come from; --noise, --beam, --ell-knee and --alpha "
                          "override any of them individually")
@@ -248,6 +248,7 @@ ACT_BANDS = {
     "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
     "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
     "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
+    "act": dict(white=14.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
 }
 # The atmosphere is a power law in both time and map domain with a slope of
 # about -3, in temperature and in polarisation alike.
