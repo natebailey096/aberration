@@ -31,9 +31,9 @@ from matplotlib.patches import Ellipse, Rectangle
 
 COR, TRUTH, RAW, INK = "#0072B2", "#C02A2A", "#E69F00", "#1A1A1A"
 COLOURS = {"aberration": COR, "modulation": RAW, "joint": "#009E73"}
-TITLES = {"aberration": "aberration (lensing QE), separate",
-          "modulation": "Doppler modulation (TT QE), separate",
-          "joint": "joint: one velocity for both effects"}
+TITLES = {"aberration": "Aberration",
+          "modulation": "Doppler modulation",
+          "joint": "Boost (aberration + modulation)"}
 plt.rcParams.update({"font.size": 11, "axes.grid": True, "grid.alpha": 0.2,
                      "legend.frameon": False, "figure.dpi": 150,
                      "savefig.bbox": "tight"})
