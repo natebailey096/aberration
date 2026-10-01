@@ -197,7 +197,8 @@ def load(path, case="T+P"):
     for name in ("vel", "velraw", "amp", "naive", "dir", "R", "Rsd", "Rerr",
                  "Ralm", "Ralm_sd_re", "Ralm_sd_im", "leak",
                  "leakerr", "noise", "mfcl", "datleak",
-                 "vel_err_cov", "vel_err_data", "vel_err_mf", "vel_err_resp"):
+                 "vel_err_cov", "vel_err_data", "vel_err_mf", "vel_err_resp",
+                 "Rinv_err", "Rinv_bias"):
         if f"{name}_{k}" in d:
             out[name] = d[f"{name}_{k}"]
     return out
@@ -741,16 +742,20 @@ def plot_response_matrix(S, path):
     fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.2), layout="constrained",
                              gridspec_kw=dict(width_ratios=[1, 1, 1.35]))
     Rerr = np.asarray(S["Rerr"], float) if "Rerr" in S else None
+    # The error on R^-1 is its own measurement (a jackknife over the response
+    # sims, made in the pipeline), not R's error carried across: R^-1 stretches
+    # whatever is poorly constrained, so its fractional error can be several
+    # times that of R.
+    Rierr = np.asarray(S["Rinv_err"], float) if "Rinv_err" in S else None
     for ax, M, name in ((axes[0], R, "$R$"), (axes[1], Ri, "$R^{-1}$")):
         vmax = np.abs(M).max()
         im = ax.imshow(M, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
         for i in range(3):
             for j in range(3):
                 txt = f"{M[i, j]:+.3f}"
-                # Only R has a measured error.  R^-1 is a nonlinear function
-                # of it, so quoting the same number there would be wrong.
-                if M is R and Rerr is not None:
-                    txt += f"\n$\\pm${Rerr[i, j]:.3f}"
+                err = Rerr if M is R else Rierr
+                if err is not None and np.isfinite(err[i, j]):
+                    txt += f"\n$\\pm${err[i, j]:.3f}"
                 ax.text(j, i, txt, ha="center", va="center",
                         fontsize=8.5, linespacing=1.3,
                         color="white" if abs(M[i, j]) > 0.62 * vmax else "0.1")

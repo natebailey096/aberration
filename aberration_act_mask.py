@@ -126,8 +126,8 @@ parser.add_argument("--noise-model", default="white",
                          "cache valid.  act adds the atmospheric 1/f knee "
                          "ACT actually sees: N_l = W (1 + (l/l_knee)^alpha) "
                          "/ B_l^2")
-parser.add_argument("--act-band", default="act",
-                    choices=["f090", "f150", "f220", "coadd", "act"],
+parser.add_argument("--act-band", default="f150",
+                    choices=["f090", "f150", "f220", "coadd"],
                     help="which ACT array-band the --noise-model act defaults "
                          "come from; --noise, --beam, --ell-knee and --alpha "
                          "override any of them individually")
@@ -248,7 +248,6 @@ ACT_BANDS = {
     "f150":  dict(white=24.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
     "f220":  dict(white=82.0, fwhm=1.01, knee_T=3800.0, knee_P=640.0),
     "coadd": dict(white=10.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
-    "act": dict(white=14.0, fwhm=1.42, knee_T=3000.0, knee_P=475.0),
 }
 # The atmosphere is a power law in both time and map domain with a slope of
 # about -3, in temperature and in polarisation alike.
@@ -1407,6 +1406,103 @@ def response_matrix(S):
     return R, sd, sd / np.sqrt(n), V
 
 
+def velocity_error_on_mean(vel, a_hats, mf_all, Vresp, Rinv):
+    """Covariance of the mean velocity, split by which ensemble it comes from.
+
+    mean(vel) = -C_KMS Rinv (mean(dat) - mf) depends on three independently
+    seeded ensembles: the data sims, the mean-field sims and the response sims.
+    Each is propagated to first order with the other two held at their central
+    values, and the three covariances add.
+
+      data        vel_i = Rinv velraw_i for fixed Rinv and mf, so this is
+                  Cov(vel_i) / n_dat.
+      mean field  d(mean a_hat)/d(mf) = -Rinv, exactly, so this is
+                  C_KMS^2 Rinv Cov(mf_i) Rinv^T / n_mf.
+      response    Rinv -> Rinv - Rinv dR Rinv for R -> R + dR, so
+                  d(a_hat) = -Rinv dR u with u = mean(a_hat), and dR has the
+                  covariance of the per-sim ensemble V over n_resp.  The
+                  covariance of dR u is therefore that of w_a = V[a] u across
+                  response sims, over n_resp.
+
+    A relative error in R shows up as the same relative error in every
+    velocity component and, through the off-diagonal elements, as leakage of
+    the large components into the small ones: dvel = -Rinv dR vel.  That is why
+    this term can dominate v_z, whose true value is small, while the data-sim
+    scatter alone suggests it is well measured.
+    """
+    n_dat, n_mf, n_resp = len(vel), len(mf_all), len(Vresp)
+    u = a_hats.mean(axis=0)
+    mf_cov = np.cov(mf_all, rowvar=False) if n_mf > 1 else np.zeros((3, 3))
+    mf_err = (C_KMS ** 2) * (Rinv @ mf_cov @ Rinv.T) / max(n_mf, 1)
+    W = np.einsum("aqr,r->aq", Vresp, u)
+    W_cov = np.cov(W, rowvar=False) if n_resp > 1 else np.zeros((3, 3))
+    resp_err = (C_KMS ** 2) * (Rinv @ W_cov @ Rinv.T) / max(n_resp, 1)
+    data_err = np.cov(vel, rowvar=False) / max(n_dat, 1)
+    return dict(data=data_err, mf=mf_err, resp=resp_err,
+                total=data_err + mf_err + resp_err)
+
+
+def response_inverse_error(Vresp, d_vec=None):
+    """Jackknife error and bias on R^-1, and optionally on the mean velocity.
+
+    Leave out one response sim at a time, rebuild R from the rest, invert it,
+    and read the spread of those inverses.  That is the sampling error of the
+    inverse of the *mean* response, which is what the velocity actually uses,
+    and it needs no assumption about how the elements of R covary: whole sims
+    are resampled, so the correlation between the three columns (they share a
+    CMB realisation per sim) is carried automatically.
+
+    It is not the scatter of the single-sim inverses.  Individual V[a] are
+    noisy and sometimes nearly singular, so inv(V[a]) has heavy tails and its
+    standard deviation overstates the error on inv(mean V) by orders of
+    magnitude.  The jackknife also measures the bias from the inverse being a
+    nonlinear function of R: (n - 1)(mean of leave-one-out - full).
+
+    Returns dict(Rinv, err, bias) and, if d_vec is given, vel_err and vel_bias
+    for -C_KMS Rinv d_vec in km/s.  Entries are NaN if a leave-one-out R is
+    singular, which is itself the warning.
+    """
+    n = len(Vresp)
+    out = dict(Rinv=np.full((3, 3), np.nan), err=np.full((3, 3), np.nan),
+               bias=np.full((3, 3), np.nan))
+    if d_vec is not None:
+        out.update(vel_err=np.full(3, np.nan), vel_bias=np.full(3, np.nan))
+    if n < 3:
+        return out
+    total = Vresp.sum(axis=0)
+    try:
+        Rinv = np.linalg.inv(total / n)
+        loo = np.linalg.inv((total[None] - Vresp) / (n - 1))
+    except np.linalg.LinAlgError:
+        return out
+    mean_loo = loo.mean(axis=0)
+    out["Rinv"] = Rinv
+    out["err"] = np.sqrt((n - 1) / n * ((loo - mean_loo) ** 2).sum(axis=0))
+    out["bias"] = (n - 1) * (mean_loo - Rinv)
+    if d_vec is not None:
+        v_full = -C_KMS * Rinv @ d_vec
+        v_loo = -C_KMS * np.einsum("apq,q->ap", loo, d_vec)
+        v_mean = v_loo.mean(axis=0)
+        out["vel_err"] = np.sqrt((n - 1) / n * ((v_loo - v_mean) ** 2).sum(axis=0))
+        out["vel_bias"] = (n - 1) * (v_mean - v_full)
+    return out
+
+
+def chi2_pvalue_3dof(resid, cov):
+    """chi^2 of a 3-vector against its covariance, and P(chi^2_3 > that).
+
+    The joint test is the right one for three components that share a mask
+    and a response matrix, because their errors are correlated: a single
+    component 2.5 sigma out is unremarkable if it was picked from three and
+    its neighbours are pulled the same way.  The survival function of a
+    chi-square with 3 degrees of freedom has the closed form used here.
+    """
+    chi2 = float(resid @ np.linalg.solve(cov, resid))
+    p = (math.erfc(math.sqrt(chi2 / 2.0))
+         + math.sqrt(2.0 * chi2 / math.pi) * math.exp(-chi2 / 2.0))
+    return chi2, p
+
+
 # 7b. Leakage into L >= 2
 # Contract the three measured columns with the true input vector and you have
 # the coherent field the real boost puts on the sky.  This is a derived view of
@@ -1602,6 +1698,36 @@ def analyse(case, mf_vecs, diffs, data_vecs):
     n_mf = len(mf_all)
 
     dat = np.array([coadd(v, case) for v in data_vecs])
+
+    # R^-1 and its error.  A small error on R does not imply a small error on
+    # R^-1: to first order d(R^-1) = -R^-1 dR R^-1, so an error along a weakly
+    # constrained direction (small eigenvalue lambda) is stretched by about
+    # 1/lambda^2.  The ratio below is that amplification, measured.
+    inv_jk = response_inverse_error(Vresp, dat.mean(axis=0) - mf)
+    Rinv_err, Rinv_bias = inv_jk["err"], inv_jk["bias"]
+    print(f"   R^-1, with its error from a jackknife over the "
+          f"{len(Vresp)} response sims")
+    for i in range(3):
+        print("     " + "   ".join(f"{Rinv[i, j]:+9.5f} +- {Rinv_err[i, j]:7.5f}"
+                                   for j in range(3)))
+    if np.all(np.isfinite(Rinv_err)):
+        rel_R = np.max(dR) / scale
+        rel_Ri = np.max(Rinv_err) / np.max(np.abs(Rinv))
+        print(f"   relative error      R {100 * rel_R:.2f}%,  R^-1 "
+              f"{100 * rel_Ri:.2f}%  (R^-1 is {rel_Ri / rel_R:.1f}x less "
+              f"certain than R)")
+        worst = np.max(np.abs(Rinv_bias) / np.maximum(Rinv_err, 1e-300))
+        print(f"   jackknife bias on R^-1 reaches {worst:.2f} of its error "
+              f"({'negligible' if worst < 0.3 else 'NOT negligible: more response sims, or a larger --response-beta'})")
+        if rel_Ri > 0.05:
+            print(f"WARNING: R^-1 is known to only {100 * rel_Ri:.1f}% "
+                  f"(largest element).  This rescales every velocity and "
+                  f"leaks the large components into the small ones; raise "
+                  f"--n-response.", flush=True)
+    else:
+        print("WARNING: a leave-one-out response matrix is singular, so the "
+              "error on R^-1 is not available; R is too poorly measured to "
+              "invert reliably.", flush=True)
     amp_list = []
     dir_list = []
     a_hat_list = []
@@ -1641,25 +1767,16 @@ def analyse(case, mf_vecs, diffs, data_vecs):
     #
     # All three are independent by construction (separate "meanfield",
     # "response", "data" seed bases), so their variances simply add.
-    u = a_hats.mean(axis=0)
-    if n_mf > 1:
-        mf_cov_raw = np.cov(mf_all, rowvar=False)
-    else:
-        mf_cov_raw = np.zeros((3, 3))
-    mf_err_cov = (C_KMS ** 2) * (Rinv @ mf_cov_raw @ Rinv.T) / max(n_mf, 1)
-
-    n_resp_used = len(Vresp)
-    W = np.einsum("aqr,r->aq", Vresp, u)
-    if n_resp_used > 1:
-        W_cov = np.cov(W, rowvar=False)
-    else:
-        W_cov = np.zeros((3, 3))
-    resp_err_cov = ((C_KMS ** 2) * (Rinv @ W_cov @ Rinv.T)
-                    / max(n_resp_used, 1))
-
-    data_err_cov = np.cov(vel, rowvar=False) / max(n_dat, 1)
-    vel_err_cov = data_err_cov + mf_err_cov + resp_err_cov
+    _err = velocity_error_on_mean(vel, a_hats, mf_all, Vresp, Rinv)
+    data_err_cov, mf_err_cov = _err["data"], _err["mf"]
+    resp_err_cov, vel_err_cov = _err["resp"], _err["total"]
     vel_sem = np.sqrt(np.clip(np.diag(vel_err_cov), 0.0, None))
+
+    # The amplitude is linear in the velocity, A = -(vel . g) / C_KMS with
+    # g = A_TRUE / |A_TRUE|^2, so its error on the mean follows from the same
+    # covariance.  The older sigma sqrt(1/n_dat + 1/n_mf) has no response term.
+    g_amp = A_TRUE / np.dot(A_TRUE, A_TRUE)
+    amp_sem = float(np.sqrt(g_amp @ vel_err_cov @ g_amp)) / C_KMS
 
     sigma = amps.std(ddof=1)
     err_mean = sigma * np.sqrt(1.0 / n_dat + 1.0 / n_mf)   # includes MF noise
@@ -1682,8 +1799,13 @@ def analyse(case, mf_vecs, diffs, data_vecs):
           f"{n_mf}-sim mean field")
     print(f"   mean A               = {amps.mean():+.4f} +- {sigma:.4f} "
           f"(sd)    (expect 1)")
-    print(f"                          {amps.mean():+.4f} +- {err_mean:.4f} "
-          f"(error on the mean, mean field included)")
+    print(f"                          {amps.mean():+.4f} +- {amp_sem:.4f} "
+          f"(error on the mean: data + mean field + response)")
+    print(f"                          data + mean field alone would read "
+          f"+- {err_mean:.4f}; response adds "
+          f"{100 * (amp_sem / err_mean - 1):.0f}% to that")
+    print(f"                          A - 1 = {amps.mean() - 1:+.4f}, "
+          f"{(amps.mean() - 1) / amp_sem:+.1f} sigma")
     print(f"   scatter sigma(A)     = {sigma:.4f}"
           f"       (full-sky forecast {sigma_pred:.4f})")
     print(f"   before R correction  = {naive.mean():+.4f}")
@@ -1706,6 +1828,17 @@ def analyse(case, mf_vecs, diffs, data_vecs):
             print(f"          data sims alone would read +-{sem_data:6.2f}; "
                   f"mean field and response add "
                   f"{100 * (sem / sem_data - 1):.0f}% to that")
+
+    resid = vel.mean(axis=0) - V_TRUE_KMS
+    chi2, p_chi2 = chi2_pvalue_3dof(resid, vel_err_cov)
+    print(f"   joint: chi^2 = {chi2:.2f} for 3 degrees of freedom, "
+          f"p = {p_chi2:.3f}   (full covariance, components correlated)")
+    exp_sd = np.sqrt(np.clip(np.diag(resp_err_cov), 0.0, None))
+    print(f"   response error on the mean velocity [km/s], by two routes")
+    print(f"      first-order propagation   " + " ".join(f"{x:7.2f}" for x in exp_sd))
+    print(f"      jackknife over response   " + " ".join(f"{x:7.2f}" for x in inv_jk["vel_err"])
+          + "   (these should agree; if not, R^-1 is too nonlinear for the first-order figure)")
+    print(f"      jackknife bias            " + " ".join(f"{x:+7.2f}" for x in inv_jk["vel_bias"]))
 
     print(f"\ndirection")
     print(f"   mean of {n_dat} sims     = ra {ra_m:6.1f} deg, "
@@ -1743,7 +1876,8 @@ def analyse(case, mf_vecs, diffs, data_vecs):
                 noise=noise, mfcl=mfcl, datleak=datleak, n_dat=n_dat,
                 n_mf=n_mf, n_resp=ar["n"],
                 vel_err_cov=vel_err_cov, vel_err_data=data_err_cov,
-                vel_err_mf=mf_err_cov, vel_err_resp=resp_err_cov)
+                vel_err_mf=mf_err_cov, vel_err_resp=resp_err_cov,
+                Rinv_err=Rinv_err, Rinv_bias=Rinv_bias)
 
 
 def sim_budget(results, n_resp):
@@ -1956,7 +2090,7 @@ def write_summary(results):
                      "Rsd", "Rerr", "Ralm", "Ralm_sd_re", "Ralm_sd_im",
                      "leak", "leakerr", "noise", "mfcl", "datleak",
                      "vel_err_cov", "vel_err_data", "vel_err_mf",
-                     "vel_err_resp"]
+                     "vel_err_resp", "Rinv_err", "Rinv_bias"]
     for k in range(len(cases)):
         r = results[cases[k]]
         for key in per_case_keys:
